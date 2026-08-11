@@ -22,16 +22,18 @@ services:
       PORT: 3100
       DATA_DIR: /app/data
       ZALO_ACCOUNT_ID: ${ZALO_ACCOUNT_ID:-demo-zalo}
-      CUSTOMER_CARE_TENANT_ID: ${CUSTOMER_CARE_TENANT_ID:-1}
       CONNECTOR_TOKEN: ${ZALO_CONNECTOR_TOKEN:?Set ZALO_CONNECTOR_TOKEN in .env}
-      CUSTOMER_CARE_WEBHOOK_URL: ${CUSTOMER_CARE_WEBHOOK_URL:-http://host.docker.internal:7002/api/internal/customer-care}
+      CUSTOMER_CARE_WEBHOOK_URL: ${CUSTOMER_CARE_WEBHOOK_URL:-http://liora-ladipage:7002/api/internal/customer-care}
       CUSTOMER_CARE_WEBHOOK_SECRET: ${CUSTOMER_CARE_WEBHOOK_SECRET:?Set CUSTOMER_CARE_WEBHOOK_SECRET in .env}
       INBOUND_RETRY_COUNT: 5
       INBOUND_RETRY_BASE_MS: 1000
     ports:
       - "127.0.0.1:3100:3100"
     networks:
-      - libredesk
+      libredesk:
+      liora-platform:
+        aliases:
+          - zalo-connector
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -51,14 +53,16 @@ services:
       PORT: 3200
       DATA_DIR: /app/data
       FACEBOOK_ACCOUNT_ID: ${FACEBOOK_ACCOUNT_ID:-demo-facebook}
-      CUSTOMER_CARE_TENANT_ID: ${CUSTOMER_CARE_TENANT_ID:-1}
       CONNECTOR_TOKEN: ${FACEBOOK_CONNECTOR_TOKEN:-${ZALO_CONNECTOR_TOKEN}}
-      CUSTOMER_CARE_WEBHOOK_URL: ${CUSTOMER_CARE_FACEBOOK_WEBHOOK_URL:-http://host.docker.internal:7002/api/internal/customer-care}
+      CUSTOMER_CARE_WEBHOOK_URL: ${CUSTOMER_CARE_FACEBOOK_WEBHOOK_URL:-http://liora-ladipage:7002/api/internal/customer-care}
       CUSTOMER_CARE_WEBHOOK_SECRET: ${CUSTOMER_CARE_WEBHOOK_SECRET:?Set CUSTOMER_CARE_WEBHOOK_SECRET in .env}
     ports:
       - "127.0.0.1:3200:3200"
     networks:
-      - libredesk
+      libredesk:
+      liora-platform:
+        aliases:
+          - facebook-connector
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

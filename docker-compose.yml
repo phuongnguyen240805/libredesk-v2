@@ -11,7 +11,10 @@ services:
       # You can always set system user password later by running `docker exec -it libredesk_app ./libredesk --set-system-user-password`.
       LIBREDESK_SYSTEM_USER_PASSWORD: ${LIBREDESK_SYSTEM_USER_PASSWORD:-}
     networks:
-      - libredesk
+      libredesk:
+      liora-platform:
+        aliases:
+          - libredesk-app
     depends_on:
       - db
       - redis
@@ -58,6 +61,9 @@ services:
 
 networks:
   libredesk:
+  liora-platform:
+    external: true
+    name: ${LIORA_PLATFORM_NETWORK:-liora-platform}
 
 volumes:
   postgres-data:

@@ -17,7 +17,6 @@ func handleGetAISuggestions(r *fastglue.Request) error {
 	)
 
 	req := ai.SuggestionRequest{
-		WorkspaceID:    "default",
 		ConversationID: conversationID,
 		LastMessages:   []string{},
 	}
@@ -113,10 +112,10 @@ func handleGetEventPipelineStatus(r *fastglue.Request) error {
 	)
 
 	type eventStats struct {
-		TotalPending    int `json:"total_pending"`
-		TotalProcessed  int `json:"total_processed"`
-		TotalFailed     int `json:"total_failed"`
-		TotalRetryWait  int `json:"total_retry_wait"`
+		TotalPending   int `json:"total_pending"`
+		TotalProcessed int `json:"total_processed"`
+		TotalFailed    int `json:"total_failed"`
+		TotalRetryWait int `json:"total_retry_wait"`
 	}
 
 	var stats eventStats

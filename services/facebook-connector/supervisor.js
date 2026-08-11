@@ -67,9 +67,8 @@ async function ensureSession(connectionKey) {
       PORT: String(childPort),
       DATA_DIR: path.join(dataDir, "sessions", connectionKey),
       FACEBOOK_ACCOUNT_ID: `pending:${connectionKey}`,
-      CUSTOMER_CARE_TENANT_ID: "1",
       CUSTOMER_CARE_WEBHOOK_URL: `${webhookBase}/channels/${connectionKey}/events`,
-      CUSTOMER_CARE_WEBHOOK_SECRET: channelSecret,
+      CUSTOMER_CARE_CHANNEL_SECRET: channelSecret,
     },
     windowsHide: true,
   });

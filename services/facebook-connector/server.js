@@ -10,10 +10,9 @@ const config = {
   dataDir: path.resolve(process.env.DATA_DIR || "./data"),
   bin: process.env.FBCHAT_E2EE_BIN || "fbchat-bridge-e2ee",
   accountId: process.env.FACEBOOK_ACCOUNT_ID || "demo-facebook",
-  tenantId: positiveInt("CUSTOMER_CARE_TENANT_ID", 1),
   token: requiredSecret("CONNECTOR_TOKEN"),
   webhookURL: requiredURL("CUSTOMER_CARE_WEBHOOK_URL"),
-  webhookSecret: requiredSecret("CUSTOMER_CARE_WEBHOOK_SECRET"),
+  channelSecret: requiredSecret("CUSTOMER_CARE_CHANNEL_SECRET"),
 };
 
 const sessionPath = path.join(config.dataDir, "session.enc.json");
@@ -134,7 +133,6 @@ async function handleBridgeEvent(event) {
   const accountId = actualFacebookId || config.accountId;
   const payload = {
     event_id: `${accountId}:${isSelf ? "outgoing" : "incoming"}:message:${messageId}`,
-    tenant_id: config.tenantId,
     provider: "facebook_personal",
     account_id: accountId,
     direction: isSelf ? "outgoing" : "incoming",
@@ -186,7 +184,7 @@ async function pushWebhook(payload) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       const timestamp = String(Date.now());
-      const signature = createHmac("sha256", config.webhookSecret).update(`${timestamp}.${body}`).digest("hex");
+      const signature = createHmac("sha256", config.channelSecret).update(`${timestamp}.${body}`).digest("hex");
       const response = await fetch(config.webhookURL, {
         method: "POST",
         headers: { "content-type": "application/json", "x-customer-care-timestamp": timestamp, "x-customer-care-signature": signature },
