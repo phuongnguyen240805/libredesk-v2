@@ -1,0 +1,405 @@
+package main
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	_ "time/tzdata"
+
+	activitylog "github.com/abhinavxd/libredesk/internal/activity_log"
+	"github.com/abhinavxd/libredesk/internal/ai"
+	"github.com/abhinavxd/libredesk/internal/aiagent"
+	auth_ "github.com/abhinavxd/libredesk/internal/auth"
+	"github.com/abhinavxd/libredesk/internal/authz"
+	businesshours "github.com/abhinavxd/libredesk/internal/business_hours"
+	"github.com/abhinavxd/libredesk/internal/colorlog"
+	"github.com/abhinavxd/libredesk/internal/csat"
+	customAttribute "github.com/abhinavxd/libredesk/internal/custom_attribute"
+	"github.com/abhinavxd/libredesk/internal/macro"
+	notifier "github.com/abhinavxd/libredesk/internal/notification"
+	"github.com/abhinavxd/libredesk/internal/report"
+	"github.com/abhinavxd/libredesk/internal/search"
+	"github.com/abhinavxd/libredesk/internal/sla"
+	umodels "github.com/abhinavxd/libredesk/internal/user/models"
+	"github.com/abhinavxd/libredesk/internal/view"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/abhinavxd/libredesk/internal/automation"
+	contextlink "github.com/abhinavxd/libredesk/internal/context_link"
+	"github.com/abhinavxd/libredesk/internal/conversation"
+	"github.com/abhinavxd/libredesk/internal/conversation/priority"
+	"github.com/abhinavxd/libredesk/internal/conversation/status"
+	"github.com/abhinavxd/libredesk/internal/eventbus"
+	"github.com/abhinavxd/libredesk/internal/followup"
+	"github.com/abhinavxd/libredesk/internal/importer"
+	"github.com/abhinavxd/libredesk/internal/inbox"
+	"github.com/abhinavxd/libredesk/internal/media"
+	"github.com/abhinavxd/libredesk/internal/oidc"
+	"github.com/abhinavxd/libredesk/internal/outbox"
+	"github.com/abhinavxd/libredesk/internal/ratelimit"
+	"github.com/abhinavxd/libredesk/internal/role"
+	"github.com/abhinavxd/libredesk/internal/setting"
+	"github.com/abhinavxd/libredesk/internal/tag"
+	"github.com/abhinavxd/libredesk/internal/team"
+	"github.com/abhinavxd/libredesk/internal/template"
+	"github.com/abhinavxd/libredesk/internal/user"
+	"github.com/abhinavxd/libredesk/internal/webhook"
+	"github.com/abhinavxd/libredesk/internal/ws"
+	"github.com/knadh/go-i18n"
+	"github.com/knadh/koanf/v2"
+	"github.com/knadh/stuffbin"
+	"github.com/valyala/fasthttp"
+	"github.com/zerodha/fastglue"
+	"github.com/zerodha/logf"
+)
+
+var (
+	ko          = koanf.New(".")
+	ctx         = context.Background()
+	appName     = "libredesk"
+	frontendDir = "frontend/dist/main"
+	widgetDir   = "frontend/dist/widget"
+
+	// Injected at build time.
+	buildString   string
+	versionString string
+)
+
+const (
+	sampleEncKey = "your-32-char-random-string-here!"
+)
+
+// App is the global app context which is passed and injected in the http handlers.
+type App struct {
+	ctx              context.Context
+	fs               stuffbin.FileSystem
+	consts           atomic.Value
+	auth             *auth_.Auth
+	authz            *authz.Enforcer
+	i18n             *i18n.I18n
+	lo               *logf.Logger
+	oidc             *oidc.Manager
+	media            *media.Manager
+	setting          *setting.Manager
+	role             *role.Manager
+	user             *user.Manager
+	team             *team.Manager
+	status           *status.Manager
+	priority         *priority.Manager
+	tag              *tag.Manager
+	inbox            *inbox.Manager
+	tmpl             *template.Manager
+	macro            *macro.Manager
+	conversation     *conversation.Manager
+	automation       *automation.Engine
+	businessHours    *businesshours.Manager
+	sla              *sla.Manager
+	csat             *csat.Manager
+	view             *view.Manager
+	ai               *ai.Manager
+	aiAgent          *aiagent.Manager
+	search           *search.Manager
+	activityLog      *activitylog.Manager
+	notifier         *notifier.Service
+	userNotification *notifier.UserNotificationManager
+	customAttribute  *customAttribute.Manager
+	report           *report.Manager
+	webhook          *webhook.Manager
+	contextLink      *contextlink.Manager
+	rateLimit        *ratelimit.Limiter
+	redis            *redis.Client
+	importer         *importer.Importer
+	wsHub            *ws.Hub
+
+	// Deplao CSKH Integration Services
+	eventDispatcher   *eventbus.Dispatcher
+	eventInbox        *eventbus.InboxStore
+	outboxWorker      *outbox.Worker
+	messageAggregator *conversation.MessageAggregator
+	followupScheduler *followup.Scheduler
+
+	// Global state that stores data on an available app update.
+	update *AppUpdate
+	// Flag to indicate if app restart is required for settings to take effect.
+	restartRequired bool
+	sync.Mutex
+}
+
+func main() {
+	// Set up signal handler.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Load command line flags into Koanf.
+	initFlags()
+
+	if ko.Bool("version") {
+		fmt.Println(buildString)
+		os.Exit(0)
+	}
+
+	// Build string injected at build time.
+	colorlog.Green("Build: %s", buildString)
+
+	// Load the config files into Koanf.
+	initConfig(ko)
+
+	// Validate custom static directory if provided.
+	if dir := getCustomStaticDir(); dir != "" {
+		if _, err := os.Stat(dir); err != nil {
+			log.Fatalf("--static-dir path not accessible: %s: %v", dir, err)
+		}
+		colorlog.Green("Using custom static directory: %s", dir)
+	}
+
+	// Init stuffbin fs with optional custom static dir overlay.
+	fs := initFS(getCustomStaticDir())
+
+	db := initDB()
+
+	if ko.Bool("install") {
+		install(ctx, db, fs, ko.Bool("idempotent-install"), !ko.Bool("yes"))
+		os.Exit(0)
+	}
+
+	if ko.Bool("set-system-user-password") {
+		setSystemUserPass(ctx, db)
+		os.Exit(0)
+	}
+
+	// Check if schema is installed.
+	installed, err := checkSchema(db)
+	if err != nil {
+		log.Fatalf("error checking db schema: %v", err)
+	}
+	if !installed {
+		log.Println("database tables are missing. Use the `--install` flag to set up the database schema.")
+		os.Exit(0)
+	}
+
+	if ko.Bool("upgrade") {
+		upgrade(db, fs, !ko.Bool("yes"))
+		os.Exit(0)
+	}
+
+	checkPendingUpgrade(db)
+
+	// Load app settings from DB into the Koanf instance.
+	settings := initSettings(db)
+	loadSettings(settings)
+
+	validateConfig(ko)
+
+	// Fallback for config typo. Logs a warning but continues to work with the incorrect key.
+	// Uses 'message.message_outgoing_scan_interval' (correct key) as default key, falls back to the common typo.
+	msgOutgoingScanIntervalKey := "message.message_outgoing_scan_interval"
+	if ko.String(msgOutgoingScanIntervalKey) == "" {
+		if ko.String("message.message_outoing_scan_interval") != "" {
+			colorlog.Red("WARNING: typo in config key 'message.message_outoing_scan_interval' detected. Use 'message.message_outgoing_scan_interval' instead in your config.toml file. Support for this incorrect key will be removed in a future release.")
+			msgOutgoingScanIntervalKey = "message.message_outoing_scan_interval"
+		}
+	}
+
+	var (
+		autoAssignInterval          = ko.MustDuration("autoassigner.autoassign_interval")
+		unsnoozeInterval            = ko.MustDuration("conversation.unsnooze_interval")
+		draftRetentionDuration      = cmp.Or(ko.Duration("conversation.draft_retention_duration"), 360*time.Hour)
+		automationWorkers           = ko.MustInt("automation.worker_count")
+		messageOutgoingQWorkers     = ko.MustDuration("message.outgoing_queue_workers")
+		messageIncomingQWorkers     = ko.MustDuration("message.incoming_queue_workers")
+		messageOutgoingScanInterval = ko.MustDuration(msgOutgoingScanIntervalKey)
+		slaEvaluationInterval       = ko.MustDuration("sla.evaluation_interval")
+		lo                          = initLogger(appName)
+		rdb                         = initRedis()
+		constants                   = initConstants()
+		i18n                        = initI18n(fs)
+		csat                        = initCSAT(db, i18n)
+		oidc                        = initOIDC(db, settings, i18n)
+		status                      = initStatus(db, i18n)
+		priority                    = initPriority(db, i18n)
+		ssrfControl                 = initSSRFControl()
+		auth                        = initAuth(oidc, rdb, i18n, ssrfControl)
+		template                    = initTemplate(db, fs, constants, i18n)
+		media                       = initMedia(db, i18n, settings)
+		inbox                       = initInbox(db, i18n)
+		team                        = initTeam(db, i18n)
+		businessHours               = initBusinessHours(db, i18n)
+		webhook                     = initWebhook(db, i18n, ssrfControl)
+		user                        = initUser(i18n, db)
+		wsHub                       = initWS(user)
+		notifier                    = initNotifier()
+		userNotification            = initUserNotification(db, i18n)
+		notifDispatcher             = initNotifDispatcher(userNotification, notifier, wsHub, ko.Bool("notification.email.enabled"))
+		automation                  = initAutomationEngine(db, i18n)
+		ai                          = initAI(ctx, db, i18n, ssrfControl)
+		sla                         = initSLA(db, team, settings, businessHours, template, user, i18n, notifDispatcher)
+	)
+
+	// Deplao CSKH Integration Services Startup
+	eventDispatcher := eventbus.NewDispatcher()
+	eventInbox := eventbus.NewInboxStore(db)
+	outboxWorker := outbox.NewWorker(db, nil, "worker_1")
+	messageAggregator := conversation.NewMessageAggregator(conversation.AggregatorConfig{}, eventDispatcher)
+	followupScheduler := followup.NewScheduler(db)
+
+	var (
+		conversation = initConversations(i18n, sla, status, priority, wsHub, db, inbox, user, team, media, settings, csat, automation, template, webhook, notifDispatcher)
+		aiAgent      = initAIAgent(db, i18n, ai, conversation, media, settings, user, notifier, rdb)
+		autoassigner = initAutoAssigner(team, user, conversation)
+		rateLimiter  = initRateLimit(rdb)
+	)
+
+	wsHub.SetConversationStore(conversation)
+	automation.SetConversationStore(conversation)
+	conversation.SetAIAgent(aiAgent)
+
+	startInboxes(ctx, inbox, conversation, user, conversation.SignAvatarURL)
+
+	go automation.Run(ctx, automationWorkers)
+	go autoassigner.Run(ctx, autoAssignInterval)
+	go conversation.Run(ctx, messageIncomingQWorkers, messageOutgoingQWorkers, messageOutgoingScanInterval)
+	go conversation.RunUnsnoozer(ctx, unsnoozeInterval)
+	go conversation.RunContinuity(ctx)
+	go webhook.Run(ctx)
+	go notifier.Run(ctx)
+	go sla.Run(ctx, slaEvaluationInterval)
+	go sla.SendNotifications(ctx)
+	go media.DeleteUnlinkedMedia(ctx)
+	go user.MonitorUserAvailability(ctx, onUsersOffline(conversation))
+	go conversation.RunDraftCleaner(ctx, draftRetentionDuration)
+	go userNotification.RunNotificationCleaner(ctx)
+	go aiAgent.Run(ctx, cmp.Or(ko.Int("ai_agent.worker_count"), 10))
+	go ai.Run(ctx)
+
+	outboxWorker.Start(ctx, 1*time.Second)
+	followupScheduler.Start(ctx, 5*time.Second)
+
+	var app = &App{
+		ctx:               ctx,
+		lo:                lo,
+		fs:                fs,
+		sla:               sla,
+		oidc:              oidc,
+		i18n:              i18n,
+		auth:              auth,
+		media:             media,
+		setting:           settings,
+		inbox:             inbox,
+		user:              user,
+		team:              team,
+		csat:              csat,
+		status:            status,
+		priority:          priority,
+		tmpl:              template,
+		notifier:          notifier,
+		consts:            atomic.Value{},
+		conversation:      conversation,
+		automation:        automation,
+		businessHours:     businessHours,
+		activityLog:       initActivityLog(db, i18n),
+		customAttribute:   initCustomAttribute(db, i18n),
+		authz:             initAuthz(i18n),
+		view:              initView(db, i18n),
+		report:            initReport(db, i18n),
+		search:            initSearch(db, i18n),
+		role:              initRole(db, i18n),
+		tag:               initTag(db, i18n),
+		macro:             initMacro(db, i18n),
+		ai:                ai,
+		aiAgent:           aiAgent,
+		importer:          initImporter(i18n),
+		webhook:           webhook,
+		contextLink:       initContextLink(db, i18n),
+		rateLimit:         rateLimiter,
+		redis:             rdb,
+		userNotification:  userNotification,
+		eventDispatcher:   eventDispatcher,
+		eventInbox:        eventInbox,
+		outboxWorker:      outboxWorker,
+		messageAggregator: messageAggregator,
+		followupScheduler: followupScheduler,
+		wsHub:            wsHub,
+	}
+	app.consts.Store(constants)
+
+	g := fastglue.NewGlue()
+	g.SetContext(app)
+	initHandlers(g, wsHub)
+
+	s := &fasthttp.Server{
+		Name:                 appName,
+		ReadTimeout:          ko.MustDuration("app.server.read_timeout"),
+		WriteTimeout:         ko.MustDuration("app.server.write_timeout"),
+		MaxRequestBodySize:   ko.MustInt("app.server.max_body_size"),
+		MaxKeepaliveDuration: ko.MustDuration("app.server.keepalive_timeout"),
+		ReadBufferSize:       ko.Int("app.server.read_buffer_size"),
+	}
+
+	go func() {
+		colorlog.Green("Server started at %s", ko.String("app.server.address"))
+		if ko.String("app.server.socket") != "" {
+			colorlog.Green("Unix socket created at %s", ko.String("app.server.socket"))
+		}
+		if err := g.ListenAndServe(ko.String("app.server.address"), ko.String("app.server.socket"), s); err != nil {
+			log.Fatalf("error starting server: %v", err)
+		}
+	}()
+
+	// Start the app update checker.
+	if ko.Bool("app.check_updates") {
+		go checkUpdates(versionString, time.Hour*1, app)
+	}
+
+	// Wait for shutdown signal.
+	<-ctx.Done()
+	colorlog.Red("Shutting down HTTP server...")
+	s.Shutdown()
+	colorlog.Red("Shutting down AI agent...")
+	aiAgent.Close()
+	colorlog.Red("Shutting down AI...")
+	ai.Close()
+	colorlog.Red("Shutting down inboxes...")
+	inbox.Close()
+	colorlog.Red("Shutting down automation...")
+	automation.Close()
+	colorlog.Red("Shutting down autoassigner...")
+	autoassigner.Close()
+	colorlog.Red("Shutting down notifier...")
+	notifier.Close()
+	colorlog.Red("Shutting down webhook...")
+	webhook.Close()
+	colorlog.Red("Shutting down conversation...")
+	conversation.Close()
+	colorlog.Red("Shutting down SLA...")
+	sla.Close()
+	colorlog.Red("Shutting down importer...")
+	app.importer.Close()
+	colorlog.Red("Shutting down database...")
+	db.Close()
+	colorlog.Red("Shutting down redis...")
+	rdb.Close()
+	colorlog.Green("Shutdown complete.")
+}
+
+// onUsersOffline returns a callback for MonitorUserAvailability that broadcasts
+// offline status to the appropriate clients based on user type.
+func onUsersOffline(conv *conversation.Manager) func([]umodels.OfflineUser) {
+	return func(users []umodels.OfflineUser) {
+		for _, u := range users {
+			switch u.Type {
+			case umodels.UserTypeAgent:
+				conv.BroadcastAgentAvailability(u.ID, umodels.Offline)
+			case umodels.UserTypeContact, umodels.UserTypeVisitor:
+				conv.BroadcastContactUpdate(u.ID, map[string]any{"availability_status": umodels.Offline})
+			}
+		}
+	}
+}

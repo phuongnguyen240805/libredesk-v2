@@ -1,0 +1,13 @@
+{{ define "info" }}
+{{ template "header" . }}
+
+<section class="center">
+    <h1>{{ .Data.Title }}</h1>
+    {{ if .Data.Message }}
+    <p class="green">{{ .Data.Message }}</p>
+    {{ end }}
+
+</section>
+
+{{ template "footer" . }}
+{{ end }}

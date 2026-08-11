@@ -1,0 +1,143 @@
+{{ define "header" }}
+<!doctype html>
+<html>
+
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1" />
+    <base target="_blank">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap"
+        rel="stylesheet">
+    <style>
+        body {
+            background-color: #f4f4f5;
+            font-family: 'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            font-size: 15px;
+            line-height: 1.6;
+            margin: 0;
+            color: #09090b;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .wrap {
+            background-color: #ffffff;
+            padding: 40px;
+            max-width: 560px;
+            margin: 0 auto;
+            border-radius: 8px;
+            border: 1px solid #e4e4e7;
+        }
+
+        .header {
+            padding-bottom: 24px;
+            margin-bottom: 28px;
+            border-bottom: 1px solid #e4e4e7;
+        }
+
+        .footer {
+            text-align: center;
+            font-size: 13px;
+            color: #71717a;
+            padding: 24px 0 8px;
+        }
+
+        .footer a {
+            color: #71717a;
+            text-decoration: none;
+        }
+
+        .gutter {
+            padding: 30px;
+        }
+
+        .button {
+            background-color: #18181b;
+            color: #fafafa !important;
+            display: inline-block;
+            border-radius: 6px;
+            padding: 12px 32px;
+            text-align: center;
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 14px;
+            letter-spacing: 0.01em;
+        }
+
+        h1 {
+            font-size: 22px;
+            font-weight: 700;
+            color: #09090b;
+            margin: 0 0 8px;
+            line-height: 1.3;
+        }
+
+        p {
+            margin: 0 0 16px;
+            color: #09090b;
+        }
+
+        .text-muted {
+            color: #71717a;
+            font-size: 14px;
+        }
+
+        img {
+            max-width: 100%;
+            height: auto;
+        }
+
+        a {
+            color: #0066cc;
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        @media screen and (max-width: 600px) {
+            .wrap {
+                max-width: 100%;
+                border-radius: 0;
+                border-left: none;
+                border-right: none;
+            }
+
+            .gutter {
+                padding: 16px;
+            }
+
+            .wrap {
+                padding: 28px 20px;
+            }
+        }
+    </style>
+</head>
+
+<body style="background-color: #f4f4f5;">
+    <div class="gutter">&nbsp;</div>
+    <div class="wrap">
+        <div class="header">
+            {{ if ne LogoURL "" }}
+                <img src="{{ LogoURL }}" alt="{{ SiteName }}" style="max-height: 25px; width: auto;">
+            {{ else if ne SiteName "" }}
+                <span style="font-size: 18px; font-weight: 700; color: #09090b;">{{ SiteName }}</span>
+            {{ else }}
+                <span style="font-size: 18px; font-weight: 700; color: #09090b;">libredesk</span>
+            {{ end }}
+        </div>
+{{ end }}
+
+{{ define "footer" }}
+    </div>
+    <div class="footer">
+        <span>Powered by <a href="https://libredesk.io/" target="_blank">libredesk</a></span>
+    </div>
+    <div class="gutter">&nbsp;</div>
+</body>
+
+</html>
+{{ end }}

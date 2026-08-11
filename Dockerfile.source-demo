@@ -1,0 +1,33 @@
+# Build the official LibreDesk Vue applications from source.
+FROM node:22-alpine AS frontend-builder
+WORKDIR /src/frontend
+RUN corepack enable
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY frontend/ ./
+RUN pnpm build:main && pnpm build:widget
+
+# Build the customized Go API/backend.
+FROM golang:1.25-alpine AS backend-builder
+WORKDIR /src
+RUN apk add --no-cache git ca-certificates
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG LIBREDESK_VERSION=v2.7.1-zalo-demo
+ARG LIBREDESK_BUILD=zalo-demo
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X 'main.buildString=${LIBREDESK_BUILD}' -X 'main.versionString=${LIBREDESK_VERSION}' -X 'github.com/abhinavxd/libredesk/internal/version.Version=${LIBREDESK_VERSION}'" \
+    -o /out/libredesk ./cmd
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates tzdata
+WORKDIR /libredesk
+COPY --from=backend-builder /out/libredesk ./libredesk
+COPY --from=backend-builder /src/i18n ./i18n
+COPY --from=backend-builder /src/static ./static
+COPY --from=backend-builder /src/schema.sql ./schema.sql
+COPY --from=backend-builder /src/config.sample.toml ./config.toml
+COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
+EXPOSE 9000
+CMD ["./libredesk", "--config", "/libredesk/config.toml"]

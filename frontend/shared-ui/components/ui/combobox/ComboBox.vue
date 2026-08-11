@@ -1,0 +1,110 @@
+<template>
+  <Popover v-model:open="open">
+    <PopoverTrigger as-child>
+      <slot name="trigger" :selected="selectedItem" :open="open">
+        <Button
+          variant="outline"
+          role="combobox"
+          :aria-expanded="open"
+          :class="['w-full justify-between', buttonClass]"
+        >
+          <span class="flex min-w-0 flex-1 items-center text-left">
+            <slot name="selected" :selected="selectedItem">
+              <span class="min-w-0 truncate">{{ selectedLabel }}</span>
+            </slot>
+          </span>
+          <CaretSortIcon class="h-4 w-4 shrink-0 opacity-50" />
+        </Button>
+      </slot>
+    </PopoverTrigger>
+    <PopoverContent class="p-0" :align="align">
+      <Command v-model:search-term="searchTerm" :filter-function="passThroughFilter">
+        <CommandInput class="h-9" :placeholder="placeholder" />
+        <CommandEmpty>{{ $t('globals.messages.notFound') }}</CommandEmpty>
+        <CommandList>
+          <CommandGroup>
+            <CommandItem
+              v-for="item in visibleItems"
+              :key="item.value"
+              :value="JSON.stringify({ label: item.label, value: item.value })"
+              @select="handleSelect"
+            >
+              <slot name="item" :item="item">{{ item.label }}</slot>
+              <CheckIcon
+                :class="
+                  cn('ml-auto h-4 w-4', String(value) === item.value ? 'opacity-100' : 'opacity-0')
+                "
+              />
+            </CommandItem>
+          </CommandGroup>
+        </CommandList>
+      </Command>
+    </PopoverContent>
+  </Popover>
+</template>
+
+<script setup>
+import { ref, computed } from 'vue'
+import { CaretSortIcon, CheckIcon } from '@radix-icons/vue'
+import { cn } from '../../../lib/utils'
+import { Button } from '../button'
+import { Popover, PopoverContent, PopoverTrigger } from '../popover'
+import {
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  Command,
+  CommandItem,
+  CommandList
+} from '../command'
+
+const RENDER_CAP = 200
+
+const props = defineProps({
+  items: {
+    type: Array,
+    required: true
+  },
+  placeholder: String,
+  defaultLabel: String,
+  buttonClass: {
+    type: String,
+    default: ''
+  },
+  align: {
+    type: String,
+    default: 'center'
+  }
+})
+
+const emit = defineEmits(['select'])
+const value = defineModel()
+const open = ref(false)
+const searchTerm = ref('')
+
+const passThroughFilter = (items) => items
+
+const filteredItems = computed(() => {
+  const term = searchTerm.value?.trim().toLowerCase()
+  if (!term) return props.items
+  return props.items.filter((item) => String(item.label).toLowerCase().includes(term))
+})
+
+const visibleItems = computed(() => filteredItems.value.slice(0, RENDER_CAP))
+
+const selectedItem = computed(() => props.items.find((i) => i.value === value.value))
+const selectedLabel = computed(() => selectedItem.value?.label || props.defaultLabel)
+
+const handleSelect = (ev) => {
+  if (typeof ev.detail.value === 'string') {
+    try {
+      const selected = JSON.parse(ev.detail.value)
+      value.value = selected.value
+      open.value = false
+      emit('select', selected)
+    } catch (e) {
+      console.error('Invalid selection value')
+    }
+  }
+}
+</script>

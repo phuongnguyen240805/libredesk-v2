@@ -1,0 +1,411 @@
+// Package media provides functionality for managing files backed by fs or S3.
+package media
+
+import (
+	"context"
+	"database/sql"
+	"embed"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/abhinavxd/libredesk/internal/dbutil"
+	"github.com/abhinavxd/libredesk/internal/envelope"
+	"github.com/abhinavxd/libredesk/internal/image"
+	"github.com/abhinavxd/libredesk/internal/media/models"
+	"github.com/gabriel-vasile/mimetype"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	"github.com/knadh/go-i18n"
+	"github.com/lib/pq"
+	"github.com/volatiletech/null/v9"
+	"github.com/zerodha/logf"
+)
+
+var (
+	//go:embed queries.sql
+	efs embed.FS
+)
+
+// Store defines the interface for media storage operations.
+type Store interface {
+	Put(name, contentType string, content io.ReadSeeker) (string, error)
+	Delete(name string) error
+	GetURL(name, disposition, fileName string) string
+	GetBlob(name string) ([]byte, error)
+	Name() string
+	// SignedURLValidator returns a validator function if the store supports signed URLs.
+	// Returns nil if the store doesn't use signed URLs (e.g., S3 handles validation itself).
+	SignedURLValidator() func(name, sig string, exp int64) bool
+}
+
+// SignedURLStore defines the interface for stores that support signed URLs.
+// This is optional and only implemented by stores that need signed URL functionality (like fs).
+type SignedURLStore interface {
+	Store
+	GetSignedURL(name string) string
+}
+
+type Manager struct {
+	store   Store
+	lo      *logf.Logger
+	i18n    *i18n.I18n
+	queries queries
+}
+
+// Opts provides options for configuring the Manager.
+type Opts struct {
+	Store Store
+	Lo    *logf.Logger
+	DB    *sqlx.DB
+	I18n  *i18n.I18n
+}
+
+// New initializes and returns a new Manager instance for handling media operations.
+func New(opt Opts) (*Manager, error) {
+	var q queries
+	if err := dbutil.ScanSQLFile("queries.sql", &q, opt.DB, efs); err != nil {
+		return nil, err
+	}
+	return &Manager{
+		store:   opt.Store,
+		lo:      opt.Lo,
+		i18n:    opt.I18n,
+		queries: q,
+	}, nil
+}
+
+// queries holds the prepared SQL statements.
+type queries struct {
+	Insert                  *sqlx.Stmt `query:"insert-media"`
+	Get                     *sqlx.Stmt `query:"get-media"`
+	GetByUUID               *sqlx.Stmt `query:"get-media-by-uuid"`
+	Delete                  *sqlx.Stmt `query:"delete-media"`
+	LinkMessageMedia        *sqlx.Stmt `query:"link-message-media"`
+	GetByModel              *sqlx.Stmt `query:"get-model-media"`
+	GetUnlinkedMessageMedia *sqlx.Stmt `query:"get-unlinked-message-media"`
+	ContentIDExists         *sqlx.Stmt `query:"content-id-exists"`
+	GetByContentIDs         *sqlx.Stmt `query:"get-media-by-content-ids"`
+	GetDraftInlineMedia     *sqlx.Stmt `query:"get-draft-inline-media"`
+}
+
+// UploadAndInsert uploads file on storage and inserts an entry in db.
+func (m *Manager) UploadAndInsert(srcFilename, contentType, contentID string, modelType null.String, modelID null.Int, content io.ReadSeeker, fileSize int, disposition null.String, meta []byte) (models.Media, error) {
+	var (
+		uuid = uuid.New()
+		err  error
+	)
+
+	// Override content type after upload (in case it was detected incorrectly).
+	_, contentType, err = m.Upload(uuid.String(), contentType, content)
+	if err != nil {
+		return models.Media{}, err
+	}
+
+	media, err := m.Insert(disposition, srcFilename, contentType, contentID, modelType, uuid.String(), modelID, fileSize, meta)
+	if err != nil {
+		m.store.Delete(uuid.String())
+		return models.Media{}, err
+	}
+	return media, nil
+}
+
+// Upload saves the media file to the storage backend - returns the generated filename and content type (after detection).
+func (m *Manager) Upload(fileName, contentType string, content io.ReadSeeker) (string, string, error) {
+	// On store file is named by UUID to avoid collisions and the actual filename is stored in DB.
+	m.lo.Debug("detecting content type for file before upload", "uuid", fileName, "source_content_type", contentType)
+
+	// Detect content type and override if needed.
+	contentType, err := m.detectContentType(contentType, content)
+	if err != nil {
+		m.lo.Error("error detecting content type", "error", err, "file_name", fileName, "content_type", contentType, "store", m.store.Name())
+		return "", "", err
+	}
+
+	fName, err := m.store.Put(fileName, contentType, content)
+	if err != nil {
+		m.lo.Error("error uploading media to store", "error", err, "file_name", fileName, "content_type", contentType, "store", m.store.Name())
+		return "", "", envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.errorUploadingFile"), nil)
+	}
+	return fName, contentType, nil
+}
+
+// Insert inserts media details into the database and returns the inserted media record.
+func (m *Manager) Insert(disposition null.String, fileName, contentType, contentID string, modelType null.String, uuid string, modelID null.Int, fileSize int, meta []byte) (models.Media, error) {
+	var id int
+	if err := m.queries.Insert.QueryRow(m.store.Name(), fileName, contentType, fileSize, meta, modelID, modelType, disposition, contentID, uuid).Scan(&id); err != nil {
+		m.lo.Error("error inserting media", "error", err, "file_name", fileName, "content_type", contentType, "store", m.store.Name())
+		return models.Media{}, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	return m.Get(id, "")
+}
+
+// GetMany fetches multiple media records by their IDs.
+func (m *Manager) GetMany(ids []int) ([]models.Media, error) {
+	out := make([]models.Media, 0, len(ids))
+	for _, id := range ids {
+		med, err := m.Get(id, "")
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, med)
+	}
+	return out, nil
+}
+
+// Get retrieves the media record by its ID and returns the media.
+func (m *Manager) Get(id int, uuid string) (models.Media, error) {
+	var media models.Media
+	if err := m.queries.Get.Get(&media, id, uuid); err != nil {
+		if err == sql.ErrNoRows {
+			return media, envelope.NewError(envelope.NotFoundError, m.i18n.T("validation.notFoundMedia"), nil)
+		}
+		m.lo.Error("error fetching media", "error", err)
+		return media, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	media.URL = m.GetURL(media.UUID, media.ContentType, media.Filename)
+	return media, nil
+}
+
+// ContentIDExists reports whether a media row with the given content_id is linked to a message in the given conversation. Scoped this way so an orphan media row (e.g., from a partial failure) doesn't short-circuit a retry into skipping the upload.
+func (m *Manager) ContentIDExists(contentID, conversationUUID string) (bool, string, error) {
+	if contentID == "" || conversationUUID == "" {
+		return false, "", nil
+	}
+	var uuid string
+	if err := m.queries.ContentIDExists.Get(&uuid, contentID, conversationUUID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, "", nil
+		}
+		m.lo.Error("error checking if content_id exists", "error", err)
+		return false, "", fmt.Errorf("checking if content_id exists: %w", err)
+	}
+	return true, uuid, nil
+}
+
+// GetByContentIDs returns media rows matching any of the given content_ids, scoped to the given conversation to prevent cross-conversation lookup.
+func (m *Manager) GetByContentIDs(contentIDs []string, conversationUUID string) ([]models.Media, error) {
+	out := []models.Media{}
+	if len(contentIDs) == 0 || conversationUUID == "" {
+		return out, nil
+	}
+	if err := m.queries.GetByContentIDs.Select(&out, pq.Array(contentIDs), conversationUUID); err != nil {
+		m.lo.Error("error fetching media by content_ids", "error", err)
+		return nil, fmt.Errorf("fetching media by content_ids: %w", err)
+	}
+	return out, nil
+}
+
+// GetDraftInlineMedia returns media by UUID only if it's unattached or linked to a message in the given conversation.
+func (m *Manager) GetDraftInlineMedia(uuid string, conversationID int) (models.Media, error) {
+	var media models.Media
+	if err := m.queries.GetDraftInlineMedia.Get(&media, uuid, conversationID); err != nil {
+		if err == sql.ErrNoRows {
+			return media, envelope.NewError(envelope.NotFoundError, m.i18n.T("validation.notFoundMedia"), nil)
+		}
+		m.lo.Error("error fetching draft inline media", "uuid", uuid, "error", err)
+		return media, envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	return media, nil
+}
+
+// GetBlob retrieves the raw binary content of a media file by its name.
+func (m *Manager) GetBlob(name string) ([]byte, error) {
+	return m.store.GetBlob(name)
+}
+
+// GetURL returns the URL for accessing a media file by its name.
+func (m *Manager) GetURL(uuid, contentType, fileName string) string {
+	// Keep some content types inline. SVG excluded.
+	disposition := "attachment"
+	if contentType != "image/svg+xml" &&
+		(strings.HasPrefix(contentType, "image/") ||
+			strings.HasPrefix(contentType, "video/") ||
+			contentType == "application/pdf") {
+		disposition = "inline"
+	}
+	return m.store.GetURL(uuid, disposition, fileName)
+}
+
+func (m *Manager) GetURLForDownload(uuid, fileName string) string {
+	return m.store.GetURL(uuid, "attachment", fileName)
+}
+
+// GetSignedURL generates a signed URL for secure media access if the store supports it.
+// Returns a regular URL if the store doesn't support signed URLs.
+func (m *Manager) GetSignedURL(name string) string {
+	if signedStore, ok := m.store.(SignedURLStore); ok {
+		return signedStore.GetSignedURL(name)
+	}
+	// Fallback to regular URL if signed URLs not supported
+	return m.GetURL(name, "", "")
+}
+
+// GetThumbnailURL returns the URL for an image thumbnail.
+func (m *Manager) GetThumbnailURL(uuid string) string {
+	if m.store.Name() == "fs" {
+		// FS validates thumbnail requests with the original UUID signature.
+		u, err := url.Parse(m.GetSignedURL(uuid))
+		if err == nil {
+			if idx := strings.LastIndex(u.Path, "/"); idx >= 0 {
+				u.Path = u.Path[:idx+1] + image.ThumbPrefix + uuid
+			} else {
+				u.Path = image.ThumbPrefix + uuid
+			}
+			return u.String()
+		}
+	}
+	return m.store.GetURL(image.ThumbPrefix+uuid, "inline", "")
+}
+
+// SignedURLValidator returns the store's signature validator if available.
+// Returns nil if the store doesn't support signed URL validation.
+func (m *Manager) SignedURLValidator() func(name, sig string, exp int64) bool {
+	return m.store.SignedURLValidator()
+}
+
+// LinkMessageMediaTx links a message's attachments and inline images to it within the given transaction, stamping a content_id on the inline ones.
+func (m *Manager) LinkMessageMediaTx(tx *sqlx.Tx, messageID int, media []models.Media, inlineUUIDs []string) error {
+	if len(media) == 0 && len(inlineUUIDs) == 0 {
+		return nil
+	}
+	ids := make([]int, 0, len(media))
+	for _, med := range media {
+		ids = append(ids, med.ID)
+	}
+	if _, err := tx.Stmtx(m.queries.LinkMessageMedia).Exec(messageID, pq.Array(ids), pq.Array(inlineUUIDs)); err != nil {
+		m.lo.Error("error linking media to message", "message_id", messageID, "error", err)
+		return fmt.Errorf("linking media to message:%d: %w", messageID, err)
+	}
+	return nil
+}
+
+// GetByModel retrieves all media files attached to a specific model.
+func (m *Manager) GetByModel(modelID int, model string) ([]models.Media, error) {
+	var media = make([]models.Media, 0)
+	if err := m.queries.GetByModel.Select(&media, model, modelID); err != nil {
+		m.lo.Error("error getting model media", "model", model, "model_id", modelID, "error", err)
+		return nil, fmt.Errorf("fetching media for model:%s model_id:%d: %w", model, modelID, err)
+	}
+	return media, nil
+}
+
+// Delete deletes a media file from both the storage backend and the database.
+func (m *Manager) Delete(name string) error {
+	if err := m.store.Delete(name); err != nil {
+		m.lo.Error("error deleting media from store", "error", err)
+		// If the file does not exist, ignore the error.
+		if !errors.Is(err, os.ErrNotExist) {
+			return envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+		}
+	}
+
+	// Thumbnail files do not exist in the database, only in the storage backend, so return early.
+	if strings.HasPrefix(name, image.ThumbPrefix) {
+		return nil
+	}
+
+	// Delete the media record from the database.
+	if _, err := m.queries.Delete.Exec(name); err != nil {
+		m.lo.Error("error deleting media from db", "error", err)
+		return envelope.NewError(envelope.GeneralError, m.i18n.T("globals.messages.somethingWentWrong"), nil)
+	}
+	return nil
+}
+
+// DeleteUnlinkedMedia is a blocking function that periodically deletes media files that are not linked to any conversation message.
+func (m *Manager) DeleteUnlinkedMedia(ctx context.Context) {
+	m.deleteUnlinkedMessageMedia()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(12 * time.Hour):
+			m.lo.Info("starting periodic deletion of unlinked media")
+			if err := m.deleteUnlinkedMessageMedia(); err != nil {
+				m.lo.Error("error deleting unlinked media", "error", err)
+			}
+		}
+	}
+}
+
+// deleteUnlinkedMessageMedia fetches all media files that are not linked to any message and deletes them from the storage backend and the database.
+func (m *Manager) deleteUnlinkedMessageMedia() error {
+	var media []models.Media
+	if err := m.queries.GetUnlinkedMessageMedia.Select(&media); err != nil {
+		m.lo.Error("error fetching unlinked media", "error", err)
+		return err
+	}
+	for _, mm := range media {
+		m.lo.Debug("deleting media not linked to any message", "media_id", mm.ID)
+		if err := m.Delete(mm.UUID); err != nil {
+			m.lo.Error("error deleting unlinked media", "error", err)
+			continue
+		}
+
+		// If it's an image, also delete the `thumb_uuid` image from store.
+		if strings.HasPrefix(mm.ContentType, "image/") {
+			thumbUUID := image.ThumbPrefix + mm.UUID
+			m.lo.Debug("deleting thumbnail for unlinked media", "thumb_uuid", thumbUUID)
+			if err := m.Delete(thumbUUID); err != nil {
+				m.lo.Error("error deleting thumbnail for unlinked media", "error", err)
+			}
+		}
+	}
+	return nil
+}
+
+// detectContentType detects the content type of a file.
+// It trusts the source content type unless it's a generic type like application/octet-stream.
+// For generic types, it uses http.DetectContentType (stdlib) as a fast path,
+// falling back to mimetype library for deeper inspection using magic numbers.
+func (m *Manager) detectContentType(sourceContentType string, content io.ReadSeeker) (string, error) {
+	// Set default if empty
+	if sourceContentType == "" {
+		sourceContentType = "application/octet-stream"
+	}
+
+	// Trust source unless it's a generic/useless type
+	if sourceContentType != "application/octet-stream" &&
+		sourceContentType != "application/data" &&
+		sourceContentType != "application/binary" {
+		m.lo.Debug("detected media content type from trusted source", "detected_type", sourceContentType)
+		return sourceContentType, nil
+	}
+
+	// Ensure we're at the start
+	content.Seek(0, io.SeekStart)
+
+	// Fast path: stdlib
+	buf := make([]byte, 512)
+	n, _ := content.Read(buf)
+	detected := http.DetectContentType(buf[:n])
+
+	// If stdlib gives a useful type, use it.
+	// stdlib defaults to application/octet-stream for unknown types.
+	if detected != "application/octet-stream" {
+		content.Seek(0, io.SeekStart)
+		m.lo.Debug("detected media content type using stdlib", "detected_type", detected, "source_type", sourceContentType)
+		return detected, nil
+	}
+
+	// Slow path: mimetype library
+	content.Seek(0, io.SeekStart)
+	mtype, err := mimetype.DetectReader(content)
+	if err != nil {
+		m.lo.Error("error detecting content type", "error", err)
+		content.Seek(0, io.SeekStart)
+		return sourceContentType, nil
+	}
+
+	detectedType := mtype.String()
+	m.lo.Debug("detected media content type using mimetype lib", "detected_type", detectedType, "source_type", sourceContentType)
+
+	content.Seek(0, io.SeekStart)
+	return detectedType, nil
+}

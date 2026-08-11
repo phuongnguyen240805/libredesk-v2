@@ -1,0 +1,284 @@
+{{ define "csat" }}
+{{ template "header" . }}
+<div class="csat-container">
+    <p class="csat-title">{{ L.T "csat.rateYourInteraction" }}</p>
+
+    <form action="/csat/{{ .Data.CSAT.UUID }}" method="POST" class="csat-form" novalidate>
+        <div class="rating-container">
+            <div class="rating-options">
+                <input type="radio" id="rating-1" name="rating" value="1" required>
+                <label for="rating-1" class="rating-option" tabindex="0">
+                    <span class="emoji">😢</span>
+                    <span class="rating-label">{{ L.T "globals.terms.poor" }}</span>
+                </label>
+
+                <input type="radio" id="rating-2" name="rating" value="2">
+                <label for="rating-2" class="rating-option" tabindex="0">
+                    <span class="emoji">😕</span>
+                    <span class="rating-label">{{ L.T "globals.terms.fair" }}</span>
+                </label>
+
+                <input type="radio" id="rating-3" name="rating" value="3">
+                <label for="rating-3" class="rating-option" tabindex="0">
+                    <span class="emoji">😊</span>
+                    <span class="rating-label">{{ L.T "globals.terms.good" }}</span>
+                </label>
+
+                <input type="radio" id="rating-4" name="rating" value="4">
+                <label for="rating-4" class="rating-option" tabindex="0">
+                    <span class="emoji">😃</span>
+                    <span class="rating-label">{{ L.T "globals.terms.great" }}</span>
+                </label>
+
+                <input type="radio" id="rating-5" name="rating" value="5">
+                <label for="rating-5" class="rating-option" tabindex="0">
+                    <span class="emoji">🤩</span>
+                    <span class="rating-label">{{ L.T "globals.terms.excellent" }}</span>
+                </label>
+            </div>
+            <div class="validation-msg" id="ratingValidationMessage">
+                {{ L.Ts "globals.messages.pleaseSelect" "name" "rating" }}
+            </div>
+        </div>
+
+        <div class="feedback-group">
+            <label for="feedback">{{ L.T "globals.messages.additionalFeedback" }}</label>
+            <textarea id="feedback" name="feedback" rows="3" maxlength="1000"
+                oninput="updateCharCount(this)"></textarea>
+            <div class="char-count"><span id="charCount">0</span> / 1000</div>
+        </div>
+
+        <button type="submit" class="button submit-button" id="submitBtn">
+            <span class="btn-text">{{ L.T "globals.messages.submit" }}</span>
+            <span class="btn-loading" style="display:none">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2v4m0 12v4m-7.07-3.93l2.83-2.83m8.48-8.48l2.83-2.83M2 12h4m12 0h4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83"/></svg>
+            </span>
+        </button>
+    </form>
+</div>
+
+<script>
+    function updateCharCount(el) {
+        var c = document.getElementById('charCount');
+        c.textContent = el.value.length;
+        c.parentElement.classList.toggle('warn', el.value.length > 900);
+    }
+
+    document.querySelector('.csat-form').addEventListener('submit', function(e) {
+        var rating = document.querySelector('input[name="rating"]:checked');
+        var msg = document.getElementById('ratingValidationMessage');
+        var btn = document.getElementById('submitBtn');
+
+        if (!rating) {
+            e.preventDefault();
+            msg.classList.add('show');
+            setTimeout(function() { msg.classList.remove('show'); }, 4000);
+            return;
+        }
+        msg.classList.remove('show');
+        btn.disabled = true;
+        btn.querySelector('.btn-text').style.display = 'none';
+        btn.querySelector('.btn-loading').style.display = 'inline-flex';
+    });
+
+    document.querySelectorAll('input[name="rating"]').forEach(function(r) {
+        r.addEventListener('change', function() {
+            document.getElementById('ratingValidationMessage').classList.remove('show');
+        });
+    });
+
+    var params = new URLSearchParams(window.location.search);
+    var initial = params.get('rating');
+    if (initial) {
+        var radio = document.getElementById('rating-' + initial);
+        if (radio) radio.checked = true;
+    }
+</script>
+
+<style>
+    .csat-container {
+        max-width: 540px;
+        margin: 0 auto;
+    }
+
+    .csat-title {
+        text-align: center;
+        font-size: 1.15em;
+        font-weight: 600;
+        color: var(--primary-color);
+        letter-spacing: -0.01em;
+        margin: 0 0 2rem;
+    }
+
+    /* Rating */
+    .rating-container {
+        margin-bottom: 2rem;
+    }
+
+    .rating-options {
+        display: flex;
+        justify-content: center;
+        gap: 8px;
+    }
+
+    .rating-options input[type="radio"] {
+        position: absolute;
+        opacity: 0;
+        pointer-events: none;
+    }
+
+    .rating-option {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+        padding: 12px 10px;
+        border-radius: 10px;
+        min-width: 72px;
+    }
+
+    .rating-option:hover {
+        background: var(--secondary-color);
+    }
+
+    .rating-option:focus-visible {
+        outline: 2px solid var(--primary-color);
+        outline-offset: 2px;
+    }
+
+    .rating-options input[type="radio"]:checked + .rating-option {
+        background: var(--secondary-color);
+    }
+
+    .emoji {
+        font-size: 2em;
+        line-height: 1;
+    }
+
+    .rating-label {
+        font-size: 0.72em;
+        font-weight: 500;
+        color: var(--text-color);
+        opacity: 0.45;
+    }
+
+    .rating-options input[type="radio"]:checked + .rating-option .rating-label {
+        opacity: 1;
+        font-weight: 600;
+    }
+
+    /* Validation */
+    .validation-msg {
+        text-align: center;
+        margin-top: 0.5rem;
+        font-size: 0.82em;
+        color: #dc2626;
+        max-height: 0;
+        opacity: 0;
+        overflow: hidden;
+        transition: max-height 0.25s ease, opacity 0.25s ease;
+    }
+
+    .validation-msg.show {
+        max-height: 2rem;
+        opacity: 1;
+    }
+
+    /* Feedback */
+    .feedback-group {
+        margin-bottom: 1.25rem;
+    }
+
+    .feedback-group label {
+        display: block;
+        margin-bottom: 0.4rem;
+        font-size: 0.88em;
+        font-weight: 500;
+        color: var(--text-color);
+    }
+
+    .feedback-group textarea {
+        width: 100%;
+        padding: 0.65rem 0.85rem;
+        border: 1px solid var(--border-color);
+        border-radius: 0.375rem;
+        font-size: 0.92em;
+        font-family: inherit;
+        line-height: 1.55;
+        resize: vertical;
+        color: var(--text-color);
+        background: var(--background-color);
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .feedback-group textarea:focus {
+        outline: none;
+        border-color: var(--primary-color);
+        box-shadow: 0 0 0 3px var(--shadow-color);
+    }
+
+    .char-count {
+        margin-top: 0.25rem;
+        text-align: right;
+        font-size: 0.72em;
+        color: var(--text-color);
+        opacity: 0.35;
+    }
+
+    .char-count.warn {
+        color: #dc2626;
+        opacity: 0.9;
+    }
+
+    /* Submit */
+    .submit-button {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+    }
+
+    .submit-button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+    }
+
+    .btn-loading {
+        display: inline-flex;
+        animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+
+    /* Responsive */
+    @media screen and (max-width: 480px) {
+        .rating-options {
+            gap: 4px;
+        }
+
+        .rating-option {
+            min-width: 58px;
+            padding: 10px 6px;
+        }
+
+        .emoji {
+            font-size: 1.6em;
+        }
+
+        .rating-label {
+            font-size: 0.65em;
+        }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .btn-loading {
+            animation-duration: 2s;
+        }
+    }
+</style>
+{{ template "footer" }}
+{{ end }}

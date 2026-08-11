@@ -1,0 +1,11 @@
+node_modules
+config.toml
+config.toml.*
+libredesk.bin
+libredesk
+libredesk.exe
+uploads
+.env
+dist/
+.vscode/
+static/widget.min.js

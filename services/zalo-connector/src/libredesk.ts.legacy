@@ -1,0 +1,95 @@
+import { config } from "./config.js";
+import { appendDeadLetter } from "./storage.js";
+
+export interface NormalizedZaloInbound {
+  account_id: string;
+  external_thread_id: string;
+  external_message_id: string;
+  conversation_uuid?: string;
+  thread_type: "user" | "group";
+  occurred_at: string;
+  sender: {
+    external_id: string;
+    display_name: string;
+    avatar_url?: string;
+  };
+  message: {
+    type: "text";
+    text: string;
+  };
+}
+
+export interface LibreDeskInboundResult {
+  message_uuid: string;
+  conversation_uuid: string;
+  duplicate?: boolean;
+}
+
+export async function pushInboundToLibreDesk(
+  payload: NormalizedZaloInbound,
+): Promise<LibreDeskInboundResult> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= config.inboundRetryCount; attempt += 1) {
+    try {
+      const response = await fetch(config.libreDeskInboundURL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-zalo-connector-token": config.connectorToken,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      const text = await response.text();
+      let decoded: unknown = {};
+      if (text) {
+        try {
+          decoded = JSON.parse(text);
+        } catch {
+          decoded = { raw: text };
+        }
+      }
+
+      if (!response.ok) {
+        throw new Error(`LibreDesk returned HTTP ${response.status}: ${text.slice(0, 500)}`);
+      }
+
+      const result = unwrapEnvelope(decoded);
+      if (!result.conversation_uuid) {
+        throw new Error("LibreDesk response is missing conversation_uuid");
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt < config.inboundRetryCount) {
+        await sleep(config.inboundRetryBaseMs * 2 ** (attempt - 1));
+      }
+    }
+  }
+
+  await appendDeadLetter(payload, lastError);
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function unwrapEnvelope(value: unknown): LibreDeskInboundResult {
+  if (!value || typeof value !== "object") {
+    throw new Error("Invalid LibreDesk response");
+  }
+  const record = value as Record<string, unknown>;
+  const candidate =
+    record.data && typeof record.data === "object"
+      ? (record.data as Record<string, unknown>)
+      : record;
+
+  return {
+    message_uuid: String(candidate.message_uuid ?? ""),
+    conversation_uuid: String(candidate.conversation_uuid ?? ""),
+    duplicate: Boolean(candidate.duplicate ?? false),
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

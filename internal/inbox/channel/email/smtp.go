@@ -1,0 +1,270 @@
+package email
+
+import (
+	"crypto/tls"
+	"fmt"
+	"math/rand"
+	"net/smtp"
+	"net/textproto"
+	"strings"
+	"time"
+
+	"github.com/abhinavxd/libredesk/internal/conversation/models"
+	imodels "github.com/abhinavxd/libredesk/internal/inbox/models"
+	"github.com/abhinavxd/libredesk/internal/stringutil"
+	"github.com/knadh/smtppool"
+)
+
+const (
+	headerReturnPath              = "Return-Path"
+	headerMessageID               = "Message-ID"
+	headerReferences              = "References"
+	headerInReplyTo               = "In-Reply-To"
+	headerLibredeskLoopPrevention = "X-Libredesk-Loop-Prevention"
+	headerLibredeskConversationID = "X-Libredesk-Conversation-UUID"
+	headerAutoreply               = "X-Autoreply"
+	headerAutoSubmitted           = "Auto-Submitted"
+
+	dispositionInline = "inline"
+)
+
+// NewSmtpPool returns a smtppool
+func NewSmtpPool(configs []imodels.SMTPConfig, oauth *imodels.OAuthConfig) ([]*smtppool.Pool, error) {
+	pools := make([]*smtppool.Pool, 0, len(configs))
+
+	for _, cfg := range configs {
+		var auth smtp.Auth
+
+		// Check if OAuth authentication should be used
+		if oauth != nil && oauth.AccessToken != "" {
+			auth = &XOAuth2SMTPAuth{
+				Username: cfg.Username,
+				Token:    oauth.AccessToken,
+			}
+		} else {
+			// Use traditional authentication methods
+			switch cfg.AuthProtocol {
+			case "cram":
+				auth = smtp.CRAMMD5Auth(cfg.Username, cfg.Password)
+			case "plain":
+				auth = smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
+			case "login":
+				auth = &smtppool.LoginAuth{Username: cfg.Username, Password: cfg.Password}
+			case "", "none":
+				// No authentication
+			default:
+				return nil, fmt.Errorf("unknown SMTP auth type '%s'", cfg.AuthProtocol)
+			}
+		}
+		cfg.Auth = auth
+
+		// TLS config
+		if cfg.TLSType != "none" {
+			cfg.TLSConfig = &tls.Config{}
+			if cfg.TLSSkipVerify {
+				cfg.TLSConfig.InsecureSkipVerify = cfg.TLSSkipVerify
+			} else {
+				cfg.TLSConfig.ServerName = cfg.Host
+			}
+
+			// SSL/TLS, not STARTTLS
+			if cfg.TLSType == "tls" {
+				cfg.SSL = true
+			}
+		}
+
+		// Parse timeouts.
+		idleTimeout, err := time.ParseDuration(cfg.IdleTimeout)
+		if err != nil {
+			idleTimeout = 30 * time.Second
+		}
+		poolWaitTimeout, err := time.ParseDuration(cfg.PoolWaitTimeout)
+		if err != nil {
+			poolWaitTimeout = 40 * time.Second
+		}
+
+		pool, err := smtppool.New(smtppool.Opt{
+			Host:              cfg.Host,
+			Port:              cfg.Port,
+			HelloHostname:     cfg.HelloHostname,
+			MaxConns:          cfg.MaxConns,
+			MaxMessageRetries: cfg.MaxMessageRetries,
+			IdleTimeout:       idleTimeout,
+			PoolWaitTimeout:   poolWaitTimeout,
+			SSL:               cfg.SSL,
+			Auth:              cfg.Auth,
+			TLSConfig:         cfg.TLSConfig,
+		})
+		if err != nil {
+			return nil, err
+		}
+		pools = append(pools, pool)
+	}
+
+	return pools, nil
+}
+
+// Send sends an email using one of the configured SMTP servers.
+func (e *Email) Send(m models.OutboundMessage) error {
+	// Refresh OAuth token if needed
+	oauthConfig, _, err := e.refreshOAuthIfNeeded()
+	if err != nil {
+		return err
+	}
+
+	// Recreate SMTP pools if token changed (handles both: we refreshed or IMAP refreshed)
+	if e.authType == imodels.AuthTypeOAuth2 && oauthConfig != nil {
+		e.smtpPoolsMu.Lock()
+		if e.smtpPoolsToken != oauthConfig.AccessToken {
+			// Close existing pools
+			for _, p := range e.smtpPools {
+				p.Close()
+			}
+
+			// Create new pools with current token
+			newPools, err := NewSmtpPool(e.smtpCfg, oauthConfig)
+			if err != nil {
+				e.smtpPoolsMu.Unlock()
+				e.lo.Error("failed to recreate smtp pools after token refresh", "inbox_id", e.Identifier(), "error", err)
+				return fmt.Errorf("failed to recreate SMTP pools: %w", err)
+			}
+			e.smtpPools = newPools
+			e.smtpPoolsToken = oauthConfig.AccessToken
+		}
+		e.smtpPoolsMu.Unlock()
+	}
+
+	// Prepare attachments if there are any
+	var attachments []smtppool.Attachment
+	if m.Attachments != nil {
+		attachments = make([]smtppool.Attachment, 0, len(m.Attachments))
+		for _, file := range m.Attachments {
+			attachment := smtppool.Attachment{
+				Filename: file.Name,
+				Header:   file.Header,
+				Content:  make([]byte, len(file.Content)),
+			}
+			copy(attachment.Content, file.Content)
+			attachments = append(attachments, attachment)
+		}
+	}
+
+	email := smtppool.Email{
+		From:        m.From,
+		To:          m.To,
+		Cc:          m.CC,
+		Bcc:         m.BCC,
+		Subject:     m.Subject,
+		Attachments: attachments,
+		Headers:     textproto.MIMEHeader{},
+	}
+
+	// Set libredesk loop prevention header to from address.
+	emailAddress, err := stringutil.ExtractEmail(m.From)
+	if err != nil {
+		e.lo.Error("failed to extract email address from the 'from' header", "error", err)
+		return fmt.Errorf("failed to extract email address from 'From' header: %w", err)
+	}
+	email.Headers.Set(headerLibredeskLoopPrevention, emailAddress)
+
+	if rt := resolveReplyTo(m.ReplyTo, e.replyTo, emailAddress, m.ConversationUUID, e.enablePlusAddressing); rt != "" {
+		email.Headers.Set("Reply-To", rt)
+		e.lo.Debug("reply-to header set", "reply_to", rt)
+	}
+
+	// Attach SMTP level headers
+	for key, value := range e.headers {
+		email.Headers.Set(key, value)
+	}
+
+	// Set In-Reply-To header
+	if m.InReplyTo != "" {
+		email.Headers.Set(headerInReplyTo, "<"+m.InReplyTo+">")
+		e.lo.Debug("in-reply-to header set", "message_id", m.InReplyTo)
+	}
+
+	// Set message id header
+	if m.SourceID != "" {
+		email.Headers.Set(headerMessageID, fmt.Sprintf("<%s>", m.SourceID))
+		e.lo.Debug("message-id header set", "message_id", m.SourceID)
+	}
+
+	// Set references header
+	var references string
+	for _, ref := range m.References {
+		references += "<" + ref + "> "
+	}
+	email.Headers.Set(headerReferences, references)
+
+	e.lo.Debug("references header set", "references", references)
+
+	// Set conversation uuid header
+	if m.ConversationUUID != "" {
+		email.Headers.Set(headerLibredeskConversationID, m.ConversationUUID)
+		e.lo.Debug("conversation uuid header set", "conversation_uuid", m.ConversationUUID)
+	}
+
+	// Set email content
+	switch m.ContentType {
+	case "plain":
+		email.Text = []byte(m.Content)
+	default:
+		email.HTML = []byte(m.Content)
+		if len(m.AltContent) > 0 {
+			email.Text = []byte(m.AltContent)
+		}
+	}
+
+	e.smtpPoolsMu.RLock()
+	defer e.smtpPoolsMu.RUnlock()
+
+	var (
+		serverCount = len(e.smtpPools)
+		server      *smtppool.Pool
+	)
+	if serverCount > 1 {
+		server = e.smtpPools[rand.Intn(serverCount)]
+	} else {
+		server = e.smtpPools[0]
+	}
+	return server.Send(email)
+}
+
+// buildPlusAddress creates a plus-addressed email for conversation matching.
+// e.g., support@company.com + uuid -> support+conv-{uuid}@company.com
+func buildPlusAddress(email, conversationUUID string) string {
+	parts := strings.SplitN(email, "@", 2)
+	if len(parts) != 2 {
+		return email
+	}
+	return fmt.Sprintf("%s+conv-%s@%s", parts[0], conversationUUID, parts[1])
+}
+
+// resolveReplyTo picks the Reply-To by precedence: per-message override, plus-addressed base (inbox reply_to
+// or From), literal inbox reply_to. Returns "" to omit the header.
+func resolveReplyTo(perMessageReplyTo, inboxReplyTo, fromEmail, conversationUUID string, enablePlusAddressing bool) string {
+	// Respect per msg override.
+	if perMessageReplyTo != "" {
+		return perMessageReplyTo
+	}
+
+	// Base address defaults to From; if inbox reply_to is set, use that instead.
+	base := fromEmail
+	if inboxReplyTo != "" {
+		if addr, err := stringutil.ExtractEmail(inboxReplyTo); err == nil {
+			base = addr
+		}
+	}
+
+	switch {
+	case enablePlusAddressing && conversationUUID != "":
+		// Plus-address the base so customer replies thread back to this conversation.
+		return buildPlusAddress(base, conversationUUID)
+	case inboxReplyTo != "":
+		// No plus-addressing, but route replies to inbox reply_to instead of From.
+		return base
+	default:
+		// Omit header; customer mail client replies to From naturally.
+		return ""
+	}
+}

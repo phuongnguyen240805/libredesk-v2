@@ -1,0 +1,69 @@
+{{ define "csat-widget" }}
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        @import url("https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&display=swap");
+        body { font-family: "Instrument Sans", "Inter", sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: transparent; }
+        .stars { display: flex; justify-content: center; gap: 8px; font-size: 2.2em; cursor: pointer; }
+        .star { color: #ddd; transition: color 0.15s ease, transform 0.15s ease; }
+        .star:hover, .star.sel { color: #f59e0b; transform: scale(1.15); }
+        .done { text-align: center; color: #666; font-size: 0.9em; margin-top: 0.5rem; display: none; }
+    </style>
+</head>
+<body>
+    <div>
+        {{ if .Data.CSAT.Responded }}
+        <p class="done" style="display:block">{{ L.T "globals.messages.thankYou" }}</p>
+        {{ else }}
+        <div class="stars" id="stars">
+            <span class="star" data-score="1">&#9733;</span>
+            <span class="star" data-score="2">&#9733;</span>
+            <span class="star" data-score="3">&#9733;</span>
+            <span class="star" data-score="4">&#9733;</span>
+            <span class="star" data-score="5">&#9733;</span>
+        </div>
+        <p class="done" id="done">{{ L.T "globals.messages.thankYou" }}</p>
+        <script>
+        (function() {
+            var uuid = '{{ .Data.CSAT.UUID }}';
+            var stars = document.querySelectorAll('#stars .star');
+            var done = false;
+
+            stars.forEach(function(s) {
+                s.addEventListener('mouseover', function(ev) {
+                    if (done) return;
+                    var score = parseInt(ev.target.dataset.score);
+                    stars.forEach(function(e, i) { e.classList.toggle('sel', i < score); });
+                });
+                s.addEventListener('mouseout', function() {
+                    if (done) return;
+                    stars.forEach(function(e) { e.classList.remove('sel'); });
+                });
+                s.addEventListener('click', function(ev) {
+                    ev.preventDefault();
+                    if (done) return;
+                    done = true;
+                    var score = ev.target.dataset.score;
+                    stars.forEach(function(e, i) { e.classList.toggle('sel', i < parseInt(score)); });
+
+                    fetch('/api/v1/csat/' + uuid + '/response', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ rating: parseInt(score) })
+                    });
+
+                    document.getElementById('stars').style.pointerEvents = 'none';
+                    document.getElementById('done').style.display = 'block';
+                });
+            });
+        })();
+        </script>
+        {{ end }}
+    </div>
+</body>
+</html>
+{{ end }}

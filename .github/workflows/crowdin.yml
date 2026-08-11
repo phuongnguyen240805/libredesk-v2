@@ -1,0 +1,46 @@
+name: Crowdin
+
+on:
+  push:
+    paths:
+      # Only trigger a Crowdin update when the source localization file is
+      # updated.
+      - 'i18n/en-US.json'
+    # Only watches for changes happening on "main" branch.
+    branches: [main]
+
+jobs:
+  crowdin:
+    runs-on: ubuntu-latest
+    # Only run on the original repository, not forks
+    if: github.event.repository.fork == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Crowdin push
+        uses: crowdin/github-action@v2
+        with:
+          # Send source (english) strings to Crowdin.
+          upload_sources: true
+          # See: https://crowdin.github.io/crowdin-cli/commands
+          # /crowdin-upload#options
+          upload_sources_args: '--preserve-hierarchy --delete-obsolete'
+          # Don't upload or download translations.
+          upload_translations: false
+          download_translations: false
+          # Source language file.
+          source: 'i18n/en-US.json'
+          # Translations files.
+          translation: 'i18n/%locale%.json'
+        env:
+          # Crowdin.com > Project > Tools > API > Project ID.
+          CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
+          # When creating a personal token in Crowdin, you'll be asked to select
+          # the necessary scopes. The basic Crowdin Personal Token scopes are
+          # the following:
+          #  - Projects (List, Get, Create, Edit) -> Read
+          #  - Translation Status -> Read Only
+          #  - Source files & strings -> Read and Write
+          #  - Translations -> Read and Write
+          CROWDIN_PERSONAL_TOKEN: ${{ secrets.CROWDIN_PERSONAL_TOKEN }}
