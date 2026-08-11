@@ -9,7 +9,9 @@ RUN apk add --no-cache \
     nodejs \
     npm
 
-RUN npm install -g pnpm
+RUN npm install -g pnpm@9.15.3
+
+RUN node --version && pnpm --version && go version
 
 WORKDIR /src
 
