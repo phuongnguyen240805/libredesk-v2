@@ -50,7 +50,7 @@ func (e *Engine) evalConversationRules(rules []models.Rule, conversation cmodels
 			}
 
 			// Record execution log in automation_runs if DB is available
-			e.recordAutomationRun(rule.Type, conversation.ID, status, errSummary)
+			e.recordAutomationRun(rule.Type, conversation.UUID, status, errSummary)
 
 			if rule.ExecutionMode == models.ExecutionModeFirstMatch {
 				e.lo.Debug("automation is first match rule execution mode, breaking out of rule evaluation", "conversation_uuid", conversation.UUID)
@@ -62,20 +62,25 @@ func (e *Engine) evalConversationRules(rules []models.Rule, conversation cmodels
 	}
 }
 
-func (e *Engine) recordAutomationRun(triggerEvent string, conversationID int, status string, errSummary string) {
+func (e *Engine) recordAutomationRun(triggerEvent string, conversationUUID string, status string, errSummary string) {
 	if e.db == nil {
 		return
 	}
 	query := `
 		INSERT INTO automation_runs (workspace_id, workflow_id, trigger_event, conversation_id, status, error_summary, started_at, finished_at)
-		VALUES ('00000000-0000-0000-0000-000000000000', gen_random_uuid(), $1, NULLIF($2, 0)::text::uuid, $3, $4, NOW(), NOW());
+		VALUES ('00000000-0000-0000-0000-000000000000', gen_random_uuid(), $1, NULLIF($2, '')::uuid, $3, $4, NOW(), NOW());
 	`
-	_, _ = e.db.Exec(query, triggerEvent, conversationID, status, errSummary)
+	_, _ = e.db.Exec(query, triggerEvent, conversationUUID, status, errSummary)
 }
 
 // evaluateFinalResult computes the final result of multiple group evaluations
 // based on the specified logical operator (AND/OR).
 func evaluateFinalResult(results []bool, operator string) bool {
+	// A rule without any valid conditions must never execute actions. Treating
+	// an empty AND set as true makes partially saved or malformed rules fire.
+	if len(results) == 0 {
+		return false
+	}
 	if operator == models.OperatorAnd {
 		for _, result := range results {
 			if !result {

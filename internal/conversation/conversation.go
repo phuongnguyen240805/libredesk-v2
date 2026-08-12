@@ -303,6 +303,7 @@ type queries struct {
 	GetConversationsByContactEmailForAI *sqlx.Stmt `query:"get-conversations-by-contact-email-for-ai"`
 	GetConversationParticipants         *sqlx.Stmt `query:"get-conversation-participants"`
 	GetUserActiveConversationsCount     *sqlx.Stmt `query:"get-user-active-conversations-count"`
+	RebindFacebookConversation          *sqlx.Stmt `query:"rebind-facebook-conversation"`
 	UpdateConversationWaitingSince      *sqlx.Stmt `query:"update-conversation-waiting-since"`
 	UpdateConversationReplyTimestamps   *sqlx.Stmt `query:"update-conversation-reply-timestamps"`
 	UpdateConversationContactLastSeen   *sqlx.Stmt `query:"update-conversation-contact-last-seen"`
@@ -362,6 +363,27 @@ type queries struct {
 	// WS list-subscribe authz.
 	FilterAuthorizedListUUIDs     *sqlx.Stmt `query:"filter-authorized-list-uuids"`
 	GetConversationUUIDsByContact *sqlx.Stmt `query:"get-conversation-uuids-by-contact"`
+}
+
+// RebindFacebookConversation moves an existing Facebook conversation to the
+// active session inbox and refreshes its transport metadata. The SQL query
+// performs the ownership checks atomically and refuses conversations belonging
+// to another connection key or external thread.
+func (c *Manager) RebindFacebookConversation(uuid string, inboxID int, externalThreadID, connectionKey string, meta map[string]any) (bool, error) {
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return false, fmt.Errorf("marshalling Facebook conversation metadata: %w", err)
+	}
+
+	result, err := c.q.RebindFacebookConversation.Exec(uuid, inboxID, externalThreadID, connectionKey, metaJSON)
+	if err != nil {
+		return false, fmt.Errorf("rebinding Facebook conversation: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("checking Facebook conversation rebind: %w", err)
+	}
+	return rows == 1, nil
 }
 
 // CreateConversation creates a new conversation. If maxConversations > 0, the insert is

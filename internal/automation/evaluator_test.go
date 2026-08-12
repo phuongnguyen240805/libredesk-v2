@@ -1045,6 +1045,11 @@ func TestMultipleActions(t *testing.T) {
 
 // Test: evaluateFinalResult function
 func TestEvaluateFinalResult(t *testing.T) {
+	t.Run("empty conditions never match", func(t *testing.T) {
+		assert.False(t, evaluateFinalResult(nil, models.OperatorAnd))
+		assert.False(t, evaluateFinalResult(nil, models.OperatorOR))
+	})
+
 	t.Run("AND operator - all true", func(t *testing.T) {
 		result := evaluateFinalResult([]bool{true, true, true}, models.OperatorAnd)
 		assert.True(t, result, "AND with all true should return true")
@@ -1069,6 +1074,17 @@ func TestEvaluateFinalResult(t *testing.T) {
 		result := evaluateFinalResult([]bool{true, true}, "INVALID")
 		assert.False(t, result, "Invalid operator should return false")
 	})
+}
+
+func TestEmptyRule_DoesNotExecuteActions(t *testing.T) {
+	mockStore := new(mockConversationStore)
+	engine := createTestEngine(mockStore)
+
+	engine.evalConversationRules([]models.Rule{
+		createTestRule(nil, []models.RuleAction{{Type: models.ActionSetStatus, Value: []string{"2"}}}, models.OperatorAnd),
+	}, createTestConversation())
+
+	assert.Equal(t, 0, mockStore.callCount)
 }
 
 // Test: Contains operator with text normalization

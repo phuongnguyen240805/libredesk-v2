@@ -21,13 +21,13 @@ import (
 
 type facebookInboundRequest struct {
 	ChannelConnectionKey string `json:"channel_connection_key"`
-	AccountID         string `json:"account_id"`
-	ExternalThreadID  string `json:"external_thread_id"`
-	ExternalMessageID string `json:"external_message_id"`
-	ConversationUUID  string `json:"conversation_uuid"`
-	ThreadType        string `json:"thread_type"`
-	OccurredAt        string `json:"occurred_at"`
-	Sender            struct {
+	AccountID            string `json:"account_id"`
+	ExternalThreadID     string `json:"external_thread_id"`
+	ExternalMessageID    string `json:"external_message_id"`
+	ConversationUUID     string `json:"conversation_uuid"`
+	ThreadType           string `json:"thread_type"`
+	OccurredAt           string `json:"occurred_at"`
+	Sender               struct {
 		ExternalID  string `json:"external_id"`
 		DisplayName string `json:"display_name"`
 		AvatarURL   string `json:"avatar_url"`
@@ -77,9 +77,23 @@ func handleFacebookInbound(r *fastglue.Request) error {
 		}
 		return r.SendEnvelope(facebookInboundResponse{ConversationUUID: conversationUUID, Duplicate: true})
 	}
+	conversationMeta := map[string]any{"facebook": map[string]any{"channel_connection_key": req.ChannelConnectionKey, "account_id": req.AccountID, "external_thread_id": req.ExternalThreadID, "thread_type": req.ThreadType}}
+	if req.ConversationUUID != "" {
+		rebound, err := app.conversation.RebindFacebookConversation(req.ConversationUUID, inboxRecord.ID, req.ExternalThreadID, req.ChannelConnectionKey, conversationMeta)
+		if err != nil {
+			return sendErrorEnvelope(r, err)
+		}
+		if !rebound {
+			// Never force an inbound event into a conversation owned by a
+			// different Facebook session. A fresh, session-scoped conversation
+			// is safer than leaking messages across connected accounts.
+			app.lo.Warn("Facebook conversation continuity rejected; creating a session-scoped conversation", "conversation_uuid", req.ConversationUUID, "connection_key", req.ChannelConnectionKey, "external_thread_id", req.ExternalThreadID)
+			req.ConversationUUID = ""
+		}
+	}
 	meta := map[string]any{"facebook": map[string]any{"channel_connection_key": req.ChannelConnectionKey, "account_id": req.AccountID, "external_thread_id": req.ExternalThreadID, "external_message_id": req.ExternalMessageID, "thread_type": req.ThreadType, "sender_external_id": req.Sender.ExternalID, "sender_avatar_url": req.Sender.AvatarURL, "occurred_at": parseFacebookOccurredAt(req.OccurredAt)}}
 	metaJSON, _ := json.Marshal(meta)
-	incoming := models.IncomingMessage{Channel: inbox.ChannelFacebookPersonal, InboxID: inboxRecord.ID, Contact: models.IncomingContact{FirstName: req.Sender.DisplayName, Email: null.StringFrom(syntheticFacebookEmail(req.ChannelConnectionKey, req.Sender.ExternalID)), AvatarURL: null.NewString(req.Sender.AvatarURL, req.Sender.AvatarURL != "")}, Subject: fmt.Sprintf("Facebook: %s", req.Sender.DisplayName), SourceID: null.StringFrom(req.ExternalMessageID), Content: req.Message.Text, ContentType: models.ContentTypeText, Meta: metaJSON, ConversationMeta: map[string]any{"facebook": map[string]any{"channel_connection_key": req.ChannelConnectionKey, "account_id": req.AccountID, "external_thread_id": req.ExternalThreadID, "thread_type": req.ThreadType}}, ConversationUUIDFromReplyTo: req.ConversationUUID}
+	incoming := models.IncomingMessage{Channel: inbox.ChannelFacebookPersonal, InboxID: inboxRecord.ID, Contact: models.IncomingContact{FirstName: req.Sender.DisplayName, Email: null.StringFrom(syntheticFacebookEmail(req.ChannelConnectionKey, req.Sender.ExternalID)), AvatarURL: null.NewString(req.Sender.AvatarURL, req.Sender.AvatarURL != "")}, Subject: fmt.Sprintf("Facebook: %s", req.Sender.DisplayName), SourceID: null.StringFrom(req.ExternalMessageID), Content: req.Message.Text, ContentType: models.ContentTypeText, Meta: metaJSON, ConversationMeta: conversationMeta, ConversationUUIDFromReplyTo: req.ConversationUUID}
 	message, err := app.conversation.ProcessIncomingMessage(incoming)
 	if err != nil {
 		return sendErrorEnvelope(r, err)

@@ -22,10 +22,10 @@ const ChannelFacebookPersonal = "facebook_personal"
 
 type Config struct {
 	ChannelConnectionKey string `json:"channel_connection_key"`
-	ConnectorURL   string `json:"connector_url"`
-	ConnectorToken string `json:"connector_token"`
-	AccountID      string `json:"account_id"`
-	RequestTimeout string `json:"request_timeout"`
+	ConnectorURL         string `json:"connector_url"`
+	ConnectorToken       string `json:"connector_token"`
+	AccountID            string `json:"account_id"`
+	RequestTimeout       string `json:"request_timeout"`
 }
 
 type Facebook struct {
@@ -95,15 +95,24 @@ func (f *Facebook) Send(message models.OutboundMessage) error {
 	var metadata struct {
 		Facebook struct {
 			ChannelConnectionKey string `json:"channel_connection_key"`
-			AccountID        string `json:"account_id"`
-			ExternalThreadID string `json:"external_thread_id"`
-			ThreadType       string `json:"thread_type"`
+			AccountID            string `json:"account_id"`
+			ExternalThreadID     string `json:"external_thread_id"`
+			ThreadType           string `json:"thread_type"`
 		} `json:"facebook"`
 	}
 	if len(message.Meta) > 0 {
 		if err := json.Unmarshal(message.Meta, &metadata); err != nil {
 			return fmt.Errorf("decoding Facebook metadata: %w", err)
 		}
+	}
+	// Current conversations normally carry session-scoped metadata. Falling
+	// back to the inbox config keeps replies working during the short migration
+	// window after a legacy conversation has been rebound.
+	if metadata.Facebook.ChannelConnectionKey == "" {
+		metadata.Facebook.ChannelConnectionKey = strings.TrimSpace(f.config.ChannelConnectionKey)
+	}
+	if metadata.Facebook.AccountID == "" {
+		metadata.Facebook.AccountID = strings.TrimSpace(f.config.AccountID)
 	}
 	if metadata.Facebook.ExternalThreadID == "" {
 		return fmt.Errorf("missing facebook.external_thread_id in conversation metadata")

@@ -426,6 +426,36 @@ LIMIT 200;
 -- name: get-conversation-uuid
 SELECT uuid from conversations where id = $1;
 
+-- name: rebind-facebook-conversation
+-- Rebind a legacy Facebook conversation only when there is evidence that it
+-- belongs to the current connector session. Conversations that already carry
+-- another connection key are deliberately left untouched.
+UPDATE conversations AS c
+SET inbox_id = $2,
+    meta = COALESCE(c.meta, '{}'::jsonb) || $5::jsonb,
+    updated_at = NOW()
+WHERE c.uuid = $1::uuid
+  AND EXISTS (
+      SELECT 1
+      FROM inboxes current_inbox
+      WHERE current_inbox.id = c.inbox_id
+        AND current_inbox.channel::text = 'facebook_personal'
+  )
+  AND COALESCE(c.meta->'facebook'->>'external_thread_id', '') IN ('', $3)
+  AND (
+      c.meta->'facebook'->>'channel_connection_key' = $4
+      OR (
+          COALESCE(c.meta->'facebook'->>'channel_connection_key', '') = ''
+          AND EXISTS (
+              SELECT 1
+              FROM conversation_messages cm
+              WHERE cm.conversation_id = c.id
+                AND cm.meta->'facebook'->>'channel_connection_key' = $4
+                AND cm.meta->'facebook'->>'external_thread_id' = $3
+          )
+      )
+  );
+
 -- name: update-conversation-assigned-user
 UPDATE conversations
 SET assigned_user_id = $2,

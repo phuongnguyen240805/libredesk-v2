@@ -9,26 +9,34 @@ const managers = new Map<string, Promise<ZaloManager>>();
 
 const server = http.createServer(async (request, response) => {
   try {
-    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-    const match = url.pathname.match(/^\/sessions\/([0-9a-f-]{36})(?:\/(status|qr|reset|messages\/send))?$/i);
+    const url = new URL(
+      request.url ?? "/",
+      `http://${request.headers.host ?? "localhost"}`,
+    );
+    const match = url.pathname.match(
+      /^\/sessions\/([0-9a-f-]{36})(?:\/(status|qr|reset|messages\/send))?$/i,
+    );
+    const connectionKey = match?.[1];
+    const action = match?.[2];
 
     if (request.method === "GET" && url.pathname === "/health") {
       return sendJSON(response, 200, { ok: true, sessions: managers.size });
     }
 
-    if (match && request.method === "GET" && match[2] === "status") {
+    if (connectionKey && request.method === "GET" && action === "status") {
       requireToken(request);
-      const manager = await getManager(match[1]);
+      const manager = await getManager(connectionKey);
       return sendJSON(response, 200, manager.getStatus());
     }
 
-    if (match && request.method === "GET" && match[2] === "qr") {
+    if (connectionKey && request.method === "GET" && action === "qr") {
       requireToken(request);
-      const manager = await getManager(match[1]);
+      const manager = await getManager(connectionKey);
       const qrPath = manager.getQRPath();
       if (!fs.existsSync(qrPath)) {
         return sendJSON(response, 404, {
-          error: "QR is not available. Check /status; a saved session may already be connected.",
+          error:
+            "QR is not available. Check /status; a saved session may already be connected.",
         });
       }
       response.writeHead(200, {
@@ -39,35 +47,58 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (match && request.method === "POST" && match[2] === "messages/send") {
+    if (
+      connectionKey &&
+      request.method === "POST" &&
+      action === "messages/send"
+    ) {
       requireToken(request);
-      const manager = await getManager(match[1]);
+      const manager = await getManager(connectionKey);
       const body = await readJSON(request);
       const accountId = requireString(body.account_id, "account_id");
-      if (accountId !== manager.getStatus().account_id) throw new HTTPError(409, "The message belongs to another Zalo account");
-      const externalThreadId = requireString(body.external_thread_id, "external_thread_id");
+      if (accountId !== manager.getStatus().account_id)
+        throw new HTTPError(409, "The message belongs to another Zalo account");
+      const externalThreadId = requireString(
+        body.external_thread_id,
+        "external_thread_id",
+      );
       const text = optionalString(body.text) ?? "";
       const attachments = parseAttachments(body.attachments);
-      if (!text && attachments.length === 0) throw new HTTPError(400, "text or attachments is required");
+      if (!text && attachments.length === 0)
+        throw new HTTPError(400, "text or attachments is required");
       const clientMessageId = optionalString(body.client_message_id);
       const threadType = body.thread_type === "group" ? "group" : "user";
-      const result = await manager.sendMessage({ externalThreadId, threadType, text, attachments, clientMessageId });
+      const result = await manager.sendMessage({
+        externalThreadId,
+        threadType,
+        text,
+        attachments,
+        clientMessageId,
+      });
       return sendJSON(response, 200, { ok: true, ...result });
     }
 
-    if (match && request.method === "POST" && match[2] === "reset") {
+    if (connectionKey && request.method === "POST" && action === "reset") {
       requireToken(request);
-      const manager = await getManager(match[1]);
+      const manager = await getManager(connectionKey);
       await manager.resetSession();
-      return sendJSON(response, 202, { ok: true, message: "Session cleared; a new QR will be generated." });
+      return sendJSON(response, 202, {
+        ok: true,
+        message: "Session cleared; a new QR will be generated.",
+      });
     }
 
-    if (match && request.method === "DELETE" && !match[2]) {
+    if (connectionKey && request.method === "DELETE" && !action) {
       requireToken(request);
-      const manager = await getManager(match[1]);
+
+      const manager = await getManager(connectionKey);
+
       await manager.disconnectSession();
-      managers.delete(match[1]);
-      return sendJSON(response, 200, { ok: true, message: "Zalo session disconnected and credentials cleared." });
+      managers.delete(connectionKey);
+      return sendJSON(response, 200, {
+        ok: true,
+        message: "Zalo session disconnected and credentials cleared.",
+      });
     }
 
     return sendJSON(response, 404, { error: "Not found" });
@@ -115,29 +146,38 @@ function requireToken(request: http.IncomingMessage): void {
   }
 }
 
-async function readJSON(request: http.IncomingMessage): Promise<Record<string, unknown>> {
+async function readJSON(
+  request: http.IncomingMessage,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > 45 * 1024 * 1024) throw new HTTPError(413, "Request body is too large");
+    if (size > 45 * 1024 * 1024)
+      throw new HTTPError(413, "Request body is too large");
     chunks.push(buffer);
   }
   try {
-    const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as unknown;
+    const parsed = JSON.parse(
+      Buffer.concat(chunks).toString("utf8") || "{}",
+    ) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("body must be an object");
     }
     return parsed as Record<string, unknown>;
   } catch (error) {
-    throw new HTTPError(400, `Invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    throw new HTTPError(
+      400,
+      `Invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
 function parseAttachments(value: unknown) {
   if (value == null) return [];
-  if (!Array.isArray(value) || value.length > 5) throw new HTTPError(400, "attachments must contain at most 5 files");
+  if (!Array.isArray(value) || value.length > 5)
+    throw new HTTPError(400, "attachments must contain at most 5 files");
   return value.map((item, index) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       throw new HTTPError(400, `attachments[${index}] is invalid`);
@@ -147,7 +187,10 @@ function parseAttachments(value: unknown) {
     const data = requireString(record.data, `attachments[${index}].data`);
     const buffer = Buffer.from(data, "base64");
     if (!buffer.length || buffer.length > 6 * 1024 * 1024) {
-      throw new HTTPError(413, `attachments[${index}] must be between 1 byte and 6 MB`);
+      throw new HTTPError(
+        413,
+        `attachments[${index}] must be between 1 byte and 6 MB`,
+      );
     }
     return {
       name,
@@ -168,7 +211,11 @@ function requireString(value: unknown, name: string): string {
   return value.trim();
 }
 
-function sendJSON(response: http.ServerResponse, status: number, data: unknown): void {
+function sendJSON(
+  response: http.ServerResponse,
+  status: number,
+  data: unknown,
+): void {
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
