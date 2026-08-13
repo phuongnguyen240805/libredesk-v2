@@ -7,6 +7,13 @@ import { ZaloManager } from "./zalo-manager.js";
 
 const managers = new Map<string, Promise<ZaloManager>>();
 
+// Some zca-js QR retry callbacks reject outside the loginQR promise even
+// though each manager already handles its own connection failure. Keep one
+// expired QR session from terminating every connected tenant session.
+process.on("unhandledRejection", (error) => {
+  console.error("[connector] unhandled async operation:", error);
+});
+
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(
@@ -14,7 +21,7 @@ const server = http.createServer(async (request, response) => {
       `http://${request.headers.host ?? "localhost"}`,
     );
     const match = url.pathname.match(
-      /^\/sessions\/([0-9a-f-]{36})(?:\/(status|qr|reset|messages\/send))?$/i,
+      /^\/sessions\/([0-9a-f-]{36})(?:\/(status|qr|reset|adopt|messages\/send))?$/i,
     );
     const connectionKey = match?.[1];
     const action = match?.[2];
@@ -88,6 +95,20 @@ const server = http.createServer(async (request, response) => {
       });
     }
 
+    if (connectionKey && request.method === "POST" && action === "adopt") {
+      requireToken(request);
+      const body = await readJSON(request);
+      const targetConnectionKey = requireUUID(
+        body.target_connection_key,
+        "target_connection_key",
+      );
+      if (targetConnectionKey === connectionKey) {
+        throw new HTTPError(400, "Source and target sessions must be different");
+      }
+      const status = await adoptSession(connectionKey, targetConnectionKey);
+      return sendJSON(response, 200, { ok: true, ...status });
+    }
+
     if (connectionKey && request.method === "DELETE" && !action) {
       requireToken(request);
 
@@ -131,6 +152,40 @@ function getManager(connectionKey: string): Promise<ZaloManager> {
   });
   managers.set(connectionKey, operation);
   return operation;
+}
+
+async function adoptSession(sourceKey: string, targetKey: string) {
+  const source = await getManager(sourceKey);
+  if (!source.isConnected()) {
+    throw new HTTPError(409, "Source Zalo session is not connected");
+  }
+
+  const existingTarget = managers.get(targetKey);
+  if (existingTarget) {
+    await (await existingTarget).disconnectSession();
+    managers.delete(targetKey);
+  }
+
+  const sourceDir = path.join(config.dataDir, "sessions", sourceKey);
+  const targetDir = path.join(config.dataDir, "sessions", targetKey);
+  await fs.promises.rm(targetDir, { recursive: true, force: true });
+  await fs.promises.mkdir(path.dirname(targetDir), { recursive: true });
+  await fs.promises.cp(sourceDir, targetDir, { recursive: true });
+
+  await source.disconnectSession();
+  managers.delete(sourceKey);
+  await fs.promises.rm(sourceDir, { recursive: true, force: true });
+
+  const target = await getManager(targetKey);
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const status = target.getStatus();
+    if (status.phase === "connected") return status;
+    if (status.phase === "error") {
+      throw new HTTPError(502, status.last_error || "Adopted Zalo session failed");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new HTTPError(504, "Adopted Zalo session did not reconnect in time");
 }
 
 server.listen(config.port, config.host, () => {
@@ -209,6 +264,14 @@ function requireString(value: unknown, name: string): string {
     throw new HTTPError(400, `${name} is required`);
   }
   return value.trim();
+}
+
+function requireUUID(value: unknown, name: string): string {
+  const result = requireString(value, name);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(result)) {
+    throw new HTTPError(400, `${name} must be a UUID`);
+  }
+  return result;
 }
 
 function sendJSON(

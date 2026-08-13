@@ -238,7 +238,15 @@ export class ZaloManager {
               case LoginQRCallbackEventType.QRCodeExpired:
               case LoginQRCallbackEventType.QRCodeDeclined:
                 this.phase = "connecting";
-                void fs.rm(this.qrPath, { force: true }).finally(() => event.actions.retry());
+                // zca-js may reject retry() when QR polling already expired.
+                // Consume that rejection so it cannot restart the connector.
+                void fs
+                  .rm(this.qrPath, { force: true })
+                  .then(() => event.actions.retry())
+                  .catch((error: unknown) => {
+                    this.lastError = error instanceof Error ? error.message : String(error);
+                    console.warn("[zalo] QR retry failed:", error);
+                  });
                 break;
               case LoginQRCallbackEventType.GotLoginInfo:
                 this.phase = "connecting";
@@ -258,7 +266,17 @@ export class ZaloManager {
       const profileRecord = this.profile && typeof this.profile === "object"
         ? this.profile as Record<string, unknown>
         : {};
-      this.accountId = stringValue(profileRecord.uid) || stringValue(profileRecord.id) || this.accountId;
+      const accountProfile = profileRecord.profile && typeof profileRecord.profile === "object"
+        ? profileRecord.profile as Record<string, unknown>
+        : profileRecord;
+      // fetchAccountInfo() returns { profile: User }, whose identity is userId.
+      // Reading root uid/id left connected accounts marked as pending.
+      this.accountId =
+        stringValue(accountProfile.userId) ||
+        stringValue(accountProfile.uid) ||
+        stringValue(accountProfile.id) ||
+        stringValue(accountProfile.globalId) ||
+        this.accountId;
 
       api.listener.start({ retryOnClose: true });
     } catch (error) {

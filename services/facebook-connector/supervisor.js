@@ -1,5 +1,7 @@
 import { createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { cp, mkdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import path from "node:path";
@@ -21,11 +23,17 @@ const server = createServer(async (request, response) => {
     if (request.url === "/health") return json(response, 200, { ok: true, sessions: sessions.size });
     requireToken(request);
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-    const match = url.pathname.match(/^\/sessions\/([0-9a-f-]{36})(?:\/(status|profiles\/[^/]+|messages\/send))?$/i);
+    const match = url.pathname.match(/^\/sessions\/([0-9a-f-]{36})(?:\/(status|adopt|profiles\/[^/]+|messages\/send))?$/i);
     if (!match) return json(response, 404, { error: "Not found" });
     const connectionKey = match[1];
-    const child = await ensureSession(connectionKey);
     const suffix = match[2];
+    if (request.method === "POST" && suffix === "adopt") {
+      const payload = JSON.parse((await readBody(request, 64 * 1024)).toString("utf8") || "{}");
+      const targetConnectionKey = requireUUID(payload.target_connection_key, "target_connection_key");
+      if (targetConnectionKey === connectionKey) throw new Error("Source and target sessions must be different");
+      return json(response, 200, { ok: true, ...(await adoptSession(connectionKey, targetConnectionKey)) });
+    }
+    const child = await ensureSession(connectionKey);
     const targetPath = suffix === "status" ? "/status"
       : suffix?.startsWith("profiles/") ? `/${suffix}`
       : suffix === "messages/send" ? "/messages/send"
@@ -74,9 +82,56 @@ async function ensureSession(connectionKey) {
   });
   const session = { port: childPort, process: processHandle };
   sessions.set(connectionKey, session);
-  processHandle.once("exit", () => sessions.delete(connectionKey));
+  processHandle.once("exit", () => {
+    if (sessions.get(connectionKey)?.process === processHandle) sessions.delete(connectionKey);
+  });
   await waitForHealth(childPort, processHandle);
   return session;
+}
+
+async function adoptSession(sourceKey, targetKey) {
+  const source = await ensureSession(sourceKey);
+  const sourceStatus = await fetchSessionStatus(source);
+  if (sourceStatus.phase !== "connected") throw new Error("Source Facebook session is not connected");
+
+  await stopSession(targetKey);
+  await stopSession(sourceKey);
+
+  const sourceDir = path.join(dataDir, "sessions", sourceKey);
+  const targetDir = path.join(dataDir, "sessions", targetKey);
+  await rm(targetDir, { recursive: true, force: true });
+  await mkdir(path.dirname(targetDir), { recursive: true });
+  await cp(sourceDir, targetDir, { recursive: true });
+  await rm(sourceDir, { recursive: true, force: true });
+
+  const target = await ensureSession(targetKey);
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const status = await fetchSessionStatus(target);
+    if (status.phase === "connected") return status;
+    if (status.phase === "error") throw new Error(status.last_error || "Adopted Facebook session failed");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("Adopted Facebook session did not reconnect in time");
+}
+
+async function stopSession(connectionKey) {
+  const session = sessions.get(connectionKey);
+  if (!session) return;
+  session.process.kill("SIGTERM");
+  await Promise.race([
+    once(session.process, "exit"),
+    new Promise((resolve) => setTimeout(resolve, 5_000)),
+  ]);
+  if (sessions.get(connectionKey)?.process === session.process) sessions.delete(connectionKey);
+}
+
+async function fetchSessionStatus(session) {
+  const response = await fetch(`http://127.0.0.1:${session.port}/status`, {
+    headers: { "x-facebook-connector-token": token },
+    signal: AbortSignal.timeout(2_000),
+  });
+  if (!response.ok) throw new Error(`Facebook session status returned HTTP ${response.status}`);
+  return response.json();
 }
 
 async function reservePort() {
@@ -122,6 +177,13 @@ function required(name) {
   const value = process.env[name]?.trim() || "";
   if (!value) throw new Error(`${name} is required`);
   return value;
+}
+function requireUUID(value, name) {
+  const result = typeof value === "string" ? value.trim() : "";
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(result)) {
+    throw new Error(`${name} must be a UUID`);
+  }
+  return result;
 }
 function requireToken(request) {
   if (request.headers["x-facebook-connector-token"] !== token) throw new Error("Invalid connector token");
