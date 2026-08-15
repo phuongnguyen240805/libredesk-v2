@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
@@ -17,6 +17,9 @@ const config = {
 
 const sessionPath = path.join(config.dataDir, "session.enc.json");
 const devicePath = path.join(config.dataDir, "e2ee-device.json");
+const inboundOutboxPath = path.join(config.dataDir, "inbound-outbox.json");
+const checkpointPath = path.join(config.dataDir, "realtime-checkpoint.json");
+const outboundReceiptsPath = path.join(config.dataDir, "outbound-receipts.json");
 const tmpDir = path.join(config.dataDir, "tmp");
 await mkdir(tmpDir, { recursive: true });
 
@@ -28,20 +31,40 @@ let lastConnectedAt;
 let lastMessageAt;
 let nextId = 1;
 let actualFacebookId = "";
+let activeCookies;
+let reconnectEnabled = true;
+let reconnectTimer;
+let reconnectAttempts = 0;
+let lastDisconnectedAt;
+let outboxRetryTimer;
+let inboundPersistQueue = Promise.resolve();
+let checkpointPersistQueue = Promise.resolve();
+let outboundPersistQueue = Promise.resolve();
+let inboundDeliveryQueue = Promise.resolve();
+let checkpoint = { recentEventIds: [] };
 const pending = new Map();
-const knownOutbound = new Set();
+const outboundReceipts = new Map();
+const outboundInFlight = new Map();
+const inboundOutbox = new Map();
+const recentInboundEvents = new Set();
+const intentionalStops = new WeakSet();
 const contactProfiles = new Map();
 const PROFILE_TTL_MS = 6 * 60 * 60 * 1000;
 const PROFILE_ERROR_TTL_MS = 5 * 60 * 1000;
 
 async function startBridge(cookies) {
-  await stopBridge();
+  activeCookies = cookies;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  await stopBridge(true);
   phase = "connecting";
   lastError = undefined;
-  bridge = spawn(config.bin, [], { stdio: ["pipe", "pipe", "pipe"] });
+
+  const child = spawn(config.bin, [], { stdio: ["pipe", "pipe", "pipe"] });
+  bridge = child;
   let buffer = "";
-  bridge.stdout.setEncoding("utf8");
-  bridge.stdout.on("data", (chunk) => {
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
     buffer += chunk;
     while (buffer.includes("\n")) {
       const index = buffer.indexOf("\n");
@@ -50,12 +73,18 @@ async function startBridge(cookies) {
       if (line) consumeBridgeLine(line);
     }
   });
-  bridge.stderr.setEncoding("utf8");
-  bridge.stderr.on("data", (chunk) => console.warn("[facebook-bridge]", chunk.trim()));
-  bridge.on("exit", (code) => {
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => console.warn("[facebook-bridge]", chunk.trim()));
+  child.on("exit", (code) => {
     rejectPending(new Error(`Facebook bridge exited (${code ?? "unknown"})`));
-    bridge = undefined;
-    if (phase !== "disconnected") phase = "error";
+    if (bridge === child) bridge = undefined;
+    if (intentionalStops.has(child)) return;
+    phase = "disconnected";
+    lastDisconnectedAt = new Date().toISOString();
+    checkpoint.lastDisconnectedAt = lastDisconnectedAt;
+    void persistCheckpoint();
+    console.warn("[facebook][trace] bridge.exit", { code });
+    scheduleReconnect();
   });
 
   await rpc("newClient", { cookies, platform: "facebook", devicePath, logLevel: "warn" });
@@ -63,16 +92,57 @@ async function startBridge(cookies) {
   profile = connected?.user;
   actualFacebookId = String(profile?.id || cookies.c_user || "");
   await rpc("connectE2EE", {});
-  phase = "connected";
-  lastConnectedAt = new Date().toISOString();
+  markConnected();
 }
 
-async function stopBridge() {
-  if (!bridge) return;
+async function stopBridge(intentional = true) {
+  const child = bridge;
+  if (!child) return;
+  if (intentional) intentionalStops.add(child);
   try { await rpc("disconnect", {}, 5_000); } catch {}
-  bridge.kill("SIGTERM");
-  bridge = undefined;
+  child.kill("SIGTERM");
+  if (bridge === child) bridge = undefined;
   rejectPending(new Error("Facebook bridge stopped"));
+}
+
+function markConnected() {
+  phase = "connected";
+  reconnectAttempts = 0;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  lastConnectedAt = new Date().toISOString();
+  lastError = undefined;
+  checkpoint.lastConnectedAt = lastConnectedAt;
+  void persistCheckpoint();
+  void drainInboundOutbox();
+  console.log("[facebook][trace] connected", {
+    accountId: actualFacebookId || config.accountId,
+    pendingEvents: inboundOutbox.size,
+  });
+}
+
+function scheduleReconnect(delayMs) {
+  if (!reconnectEnabled || reconnectTimer || !activeCookies) return;
+  let resolvedDelay = delayMs;
+  if (resolvedDelay == null) {
+    reconnectAttempts += 1;
+    const base = Math.min(60_000, 1_000 * 2 ** Math.min(reconnectAttempts - 1, 6));
+    resolvedDelay = Math.min(60_000, base + Math.floor(base * Math.random() * 0.25));
+  }
+  console.log("[facebook][trace] reconnect.scheduled", {
+    attempt: reconnectAttempts,
+    delayMs: resolvedDelay,
+  });
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = undefined;
+    void startBridge(activeCookies).catch((error) => {
+      phase = "error";
+      lastError = error instanceof Error ? error.message : String(error);
+      console.error("[facebook][trace] reconnect.failed", error);
+      scheduleReconnect();
+    });
+  }, resolvedDelay);
+  reconnectTimer.unref();
 }
 
 function rpc(method, params, timeoutMs = 30_000) {
@@ -107,23 +177,47 @@ function consumeBridgeLine(line) {
 
 async function handleBridgeEvent(event) {
   if (event.type === "ready" || event.type === "e2eeConnected" || event.type === "reconnected") {
-    phase = "connected";
-    lastConnectedAt = new Date().toISOString();
+    markConnected();
     return;
   }
-  if (event.type === "error" || event.type === "disconnected") {
+  if (event.type === "error") {
+    lastError = event.data?.message || "Facebook bridge error";
+    return;
+  }
+  if (event.type === "disconnected") {
+    phase = "disconnected";
+    lastDisconnectedAt = new Date().toISOString();
     lastError = event.data?.message || "Facebook bridge disconnected";
-    if (event.type === "disconnected") phase = "disconnected";
+    checkpoint.lastDisconnectedAt = lastDisconnectedAt;
+    void persistCheckpoint();
+    console.warn("[facebook][trace] disconnected", { error: lastError });
+    scheduleReconnect();
+    return;
+  }
+  if (event.type === "readReceipt") {
+    await handleFacebookReadReceipt(event);
+    return;
+  }
+  if (event.type === "e2eeReceipt") {
+    await handleFacebookE2EEReceipt(event);
     return;
   }
   if (event.type !== "message" && event.type !== "e2eeMessage") return;
   const data = event.data || {};
   const messageId = String(data.id || data.messageId || "");
-  if (!messageId || knownOutbound.delete(messageId)) return;
+  if (!messageId) return;
   const threadId = String(data.threadId || String(data.chatJid || "").split("@")[0] || "");
   const senderId = String(data.senderId || String(data.senderJid || "").split("@")[0] || threadId);
   if (!threadId || !senderId) return;
   const isSelf = senderId === actualFacebookId;
+  const connectorOutbound = isSelf ? findOutboundReceipt(messageId) : undefined;
+  if (connectorOutbound) {
+    console.log("[facebook][trace] self.echo.detected", {
+      threadId,
+      messageId,
+      clientMessageId: connectorOutbound.clientMessageId,
+    });
+  }
   const threadType = Number(data.threadType) > 1 ? "group" : "user";
   const contactId = isSelf ? threadId : senderId;
   const contact = await getFacebookContact(contactId);
@@ -131,6 +225,7 @@ async function handleBridgeEvent(event) {
   const text = String(data.text || "").trim() || attachmentPlaceholder(attachments);
   if (!text) return;
   const accountId = actualFacebookId || config.accountId;
+  const occurredAt = new Date(Number(data.timestampMs || event.timestamp || Date.now())).toISOString();
   const payload = {
     event_id: `${accountId}:${isSelf ? "outgoing" : "incoming"}:message:${messageId}`,
     provider: "facebook_personal",
@@ -139,8 +234,9 @@ async function handleBridgeEvent(event) {
     is_self: isSelf,
     external_thread_id: threadId,
     external_message_id: `${accountId}:${messageId}`,
+    ...(connectorOutbound?.clientMessageId ? { client_message_id: connectorOutbound.clientMessageId } : {}),
     thread_type: threadType,
-    occurred_at: new Date(Number(data.timestampMs || event.timestamp || Date.now())).toISOString(),
+    occurred_at: occurredAt,
     sender: {
       external_id: contactId,
       display_name: String(
@@ -153,8 +249,83 @@ async function handleBridgeEvent(event) {
     },
     message: { type: "text", text },
   };
-  await pushWebhook(payload);
-  lastMessageAt = new Date().toISOString();
+  console.log("[facebook][trace] message.detected", {
+    eventId: payload.event_id,
+    direction: payload.direction,
+    isSelf,
+    threadId,
+    messageId: payload.external_message_id,
+  });
+  await enqueueInbound(payload, messageId, threadId);
+  lastMessageAt = occurredAt;
+}
+
+async function handleFacebookReadReceipt(event) {
+  const data = event.data || {};
+  const accountId = actualFacebookId || config.accountId;
+  const threadId = String(data.threadId || "");
+  const readerId = String(data.readerId || "");
+  const watermarkMs = Number(data.readWatermarkTimestampMs || 0);
+  if (!threadId || !Number.isFinite(watermarkMs) || watermarkMs <= 0) return;
+
+  // LSMarkThreadReadV2 also emits readReceipt with ReaderID=self. That means the
+  // agent read the customer's messages, not that the customer read our outgoing
+  // messages, so it must not advance outbound delivery status.
+  if (readerId && actualFacebookId && readerId === actualFacebookId) return;
+
+  const occurredMs = Number(data.timestampMs || event.timestamp || Date.now());
+  const payload = {
+    event_id: `${accountId}:delivery:read:${threadId}:watermark:${watermarkMs}:${readerId || "peer"}`,
+    event_type: "delivery_status",
+    provider: "facebook_personal",
+    account_id: accountId,
+    external_thread_id: threadId,
+    status: "read",
+    occurred_at: new Date(Number.isFinite(occurredMs) ? occurredMs : Date.now()).toISOString(),
+    watermark_at: new Date(watermarkMs).toISOString(),
+  };
+  console.log("[facebook][trace] delivery.detected", {
+    eventId: payload.event_id, status: payload.status, threadId, readerId, watermarkMs,
+  });
+  await enqueueInbound(payload, `watermark:${watermarkMs}`, threadId);
+}
+
+async function handleFacebookE2EEReceipt(event) {
+  const data = event.data || {};
+  const accountId = actualFacebookId || config.accountId;
+  const receiptType = String(data.type || "").toLowerCase();
+  const senderId = String(data.sender || "").split("@")[0];
+  if (senderId && actualFacebookId && senderId === actualFacebookId) return;
+
+  let status;
+  if (["read", "read-self", "played", "played-self"].includes(receiptType)) status = "read";
+  else if (["", "inactive"].includes(receiptType)) status = "delivered";
+  else return; // retry/sender/unknown receipts are not customer delivery states.
+
+  const threadId = String(data.chat || "").split("@")[0];
+  const rawIds = [...new Set((Array.isArray(data.messageIds) ? data.messageIds : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))];
+  if (!threadId || !rawIds.length) return;
+  const externalIds = rawIds.map((id) => `${accountId}:${id}`);
+  const connectorOutbound = rawIds.map((id) => findOutboundReceipt(id)).find(Boolean);
+  const occurredMs = Number(event.timestamp || Date.now());
+  const payload = {
+    event_id: `${accountId}:delivery:${status}:${threadId}:${rawIds.join(",")}`,
+    event_type: "delivery_status",
+    provider: "facebook_personal",
+    account_id: accountId,
+    external_thread_id: threadId,
+    external_message_id: externalIds[0],
+    external_message_ids: externalIds,
+    ...(connectorOutbound?.clientMessageId ? { client_message_id: connectorOutbound.clientMessageId } : {}),
+    status,
+    occurred_at: new Date(Number.isFinite(occurredMs) ? occurredMs : Date.now()).toISOString(),
+  };
+  console.log("[facebook][trace] delivery.detected", {
+    eventId: payload.event_id, status, threadId, externalMessageIds: externalIds, receiptType,
+  });
+  await enqueueInbound(payload, rawIds[0], threadId);
 }
 
 async function getFacebookContact(userId) {
@@ -185,7 +356,10 @@ async function pushWebhook(payload) {
     try {
       const timestamp = String(Date.now());
       const signature = createHmac("sha256", config.channelSecret).update(`${timestamp}.${body}`).digest("hex");
-      const response = await fetch(config.webhookURL, {
+      const targetURL = payload.event_type === "delivery_status"
+        ? config.webhookURL.replace(/\/events\/?$/, "/delivery")
+        : config.webhookURL;
+      const response = await fetch(targetURL, {
         method: "POST",
         headers: { "content-type": "application/json", "x-customer-care-timestamp": timestamp, "x-customer-care-signature": signature },
         body,
@@ -201,7 +375,153 @@ async function pushWebhook(payload) {
   throw error;
 }
 
+async function enqueueInbound(payload, rawMessageId, threadId) {
+  if (recentInboundEvents.has(payload.event_id)) {
+    console.log("[facebook][trace] event.duplicate.skip", { eventId: payload.event_id });
+    return;
+  }
+  if (!inboundOutbox.has(payload.event_id)) {
+    inboundOutbox.set(payload.event_id, {
+      eventId: payload.event_id,
+      payload,
+      queuedAt: new Date().toISOString(),
+    });
+  }
+  checkpoint.lastEventId = payload.event_id;
+  checkpoint.lastMessageId = rawMessageId;
+  checkpoint.lastThreadId = threadId;
+  checkpoint.lastEventAt = payload.occurred_at;
+  await Promise.all([persistInboundOutbox(), persistCheckpoint()]);
+  void drainInboundOutbox();
+}
+
+function persistInboundOutbox() {
+  inboundPersistQueue = inboundPersistQueue
+    .catch(() => undefined)
+    .then(() => atomicWriteJSON(
+      inboundOutboxPath,
+      [...inboundOutbox.values()].sort((a, b) => a.queuedAt.localeCompare(b.queuedAt)),
+    ));
+  return inboundPersistQueue;
+}
+
+function persistCheckpoint() {
+  checkpointPersistQueue = checkpointPersistQueue
+    .catch(() => undefined)
+    .then(() => atomicWriteJSON(checkpointPath, checkpoint));
+  return checkpointPersistQueue;
+}
+
+function persistOutboundReceipts() {
+  outboundPersistQueue = outboundPersistQueue
+    .catch(() => undefined)
+    .then(async () => {
+      const receipts = [...outboundReceipts.values()]
+        .sort((a, b) => b.sentAt.localeCompare(a.sentAt))
+        .slice(0, 2_000);
+      outboundReceipts.clear();
+      for (const receipt of receipts) {
+        outboundReceipts.set(receipt.clientMessageId, receipt);
+      }
+      await atomicWriteJSON(outboundReceiptsPath, receipts);
+    });
+  return outboundPersistQueue;
+}
+
+function drainInboundOutbox() {
+  inboundDeliveryQueue = inboundDeliveryQueue
+    .catch(() => undefined)
+    .then(async () => {
+      if (outboxRetryTimer) {
+        clearTimeout(outboxRetryTimer);
+        outboxRetryTimer = undefined;
+      }
+      const records = [...inboundOutbox.values()].sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
+      for (const record of records) {
+        const payload = record.payload;
+        console.log("[facebook][trace] webhook.start", {
+          eventId: payload.event_id,
+          pendingEvents: inboundOutbox.size,
+        });
+        try {
+          await pushWebhook(payload);
+          inboundOutbox.delete(record.eventId);
+          rememberProcessedEvent(record.eventId);
+          await Promise.all([persistInboundOutbox(), persistCheckpoint()]);
+          console.log("[facebook][trace] webhook.ok", {
+            eventId: payload.event_id,
+            pendingEvents: inboundOutbox.size,
+          });
+        } catch (error) {
+          lastError = `webhook delivery failed: ${error instanceof Error ? error.message : String(error)}`;
+          console.error("[facebook][trace] webhook.pending", {
+            eventId: payload.event_id,
+            pendingEvents: inboundOutbox.size,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          scheduleOutboxRetry();
+          break;
+        }
+      }
+    });
+  return inboundDeliveryQueue;
+}
+
+function rememberProcessedEvent(eventId) {
+  recentInboundEvents.add(eventId);
+  const recent = [eventId, ...(checkpoint.recentEventIds || []).filter((value) => value !== eventId)].slice(0, 500);
+  checkpoint.recentEventIds = recent;
+  const keep = new Set(recent);
+  for (const value of recentInboundEvents) if (!keep.has(value)) recentInboundEvents.delete(value);
+}
+
+function scheduleOutboxRetry() {
+  if (outboxRetryTimer || !inboundOutbox.size) return;
+  outboxRetryTimer = setTimeout(() => {
+    outboxRetryTimer = undefined;
+    void drainInboundOutbox();
+  }, 15_000);
+  outboxRetryTimer.unref();
+}
+
+function findOutboundReceipt(messageId) {
+  const needle = String(messageId || "").trim();
+  if (!needle) return undefined;
+  for (const receipt of outboundReceipts.values()) {
+    const externalId = String(receipt.externalMessageId || "").trim();
+    if (externalId === needle || externalId.endsWith(`:${needle}`)) return receipt;
+  }
+  return undefined;
+}
+
 async function sendMessage(body) {
+  const clientMessageId = optionalString(body.client_message_id);
+  if (clientMessageId) {
+    const receipt = outboundReceipts.get(clientMessageId);
+    if (receipt) return { externalMessageId: receipt.externalMessageId };
+    const inFlight = outboundInFlight.get(clientMessageId);
+    if (inFlight) return inFlight;
+  }
+
+  const operation = sendMessageOnce(body);
+  if (clientMessageId) outboundInFlight.set(clientMessageId, operation);
+  try {
+    const result = await operation;
+    if (clientMessageId) {
+      outboundReceipts.set(clientMessageId, {
+        clientMessageId,
+        externalMessageId: result.externalMessageId,
+        sentAt: new Date().toISOString(),
+      });
+      await persistOutboundReceipts();
+    }
+    return result;
+  } finally {
+    if (clientMessageId) outboundInFlight.delete(clientMessageId);
+  }
+}
+
+async function sendMessageOnce(body) {
   if (phase !== "connected") throw new HTTPError(409, "Facebook account is not connected");
   const threadId = requireNumeric(body.external_thread_id, "external_thread_id");
   const text = optionalString(body.text) || "";
@@ -229,9 +549,7 @@ async function sendMessage(body) {
       await rm(filePath, { force: true });
     }
   }
-  const externalMessageId = String(result?.messageId || result?.id || "");
-  if (externalMessageId) knownOutbound.add(externalMessageId);
-  return { externalMessageId };
+  return { externalMessageId: String(result?.messageId || result?.id || "") };
 }
 
 const server = createServer(async (request, response) => {
@@ -251,13 +569,25 @@ const server = createServer(async (request, response) => {
       requireToken(request);
       const body = await readJSON(request, 128 * 1024);
       const cookies = parseCookies(requireString(body.cookie, "cookie"));
+      reconnectEnabled = true;
+      activeCookies = cookies;
       await saveSession(cookies);
-      await startBridge(cookies);
+      try {
+        await startBridge(cookies);
+      } catch (error) {
+        scheduleReconnect();
+        throw error;
+      }
       return json(response, 200, status());
     }
     if (request.method === "DELETE" && url.pathname === "/session") {
       requireToken(request);
-      await stopBridge();
+      reconnectEnabled = false;
+      activeCookies = undefined;
+      reconnectAttempts = 0;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+      await stopBridge(true);
       await Promise.all([rm(sessionPath, { force: true }), rm(devicePath, { force: true })]);
       phase = "disconnected";
       profile = undefined;
@@ -275,7 +605,18 @@ const server = createServer(async (request, response) => {
 });
 
 function status() {
-  return { phase, account_id: actualFacebookId || config.accountId, facebook_user_id: actualFacebookId || undefined, profile, last_connected_at: lastConnectedAt, last_message_at: lastMessageAt, last_error: lastError };
+  return {
+    phase,
+    account_id: actualFacebookId || config.accountId,
+    facebook_user_id: actualFacebookId || undefined,
+    profile,
+    last_connected_at: lastConnectedAt,
+    last_disconnected_at: lastDisconnectedAt,
+    last_message_at: lastMessageAt,
+    last_error: lastError,
+    reconnect_attempts: reconnectAttempts,
+    pending_event_count: inboundOutbox.size,
+  };
 }
 
 function parseCookies(cookie) {
@@ -315,6 +656,66 @@ async function loadSession() {
   } catch { return undefined; }
 }
 
+
+async function loadRealtimeState() {
+  const storedCheckpoint = await readJSONFile(checkpointPath, { recentEventIds: [] });
+  checkpoint = {
+    ...storedCheckpoint,
+    recentEventIds: Array.isArray(storedCheckpoint?.recentEventIds)
+      ? storedCheckpoint.recentEventIds.filter((value) => typeof value === "string").slice(0, 500)
+      : [],
+  };
+  for (const eventId of checkpoint.recentEventIds) recentInboundEvents.add(eventId);
+  lastConnectedAt = optionalString(checkpoint.lastConnectedAt);
+  lastDisconnectedAt = optionalString(checkpoint.lastDisconnectedAt);
+  lastMessageAt = optionalString(checkpoint.lastEventAt);
+
+  const storedOutbox = await readJSONFile(inboundOutboxPath, []);
+  if (Array.isArray(storedOutbox)) {
+    for (const record of storedOutbox) {
+      if (!record || typeof record !== "object") continue;
+      if (typeof record.eventId !== "string" || !record.payload) continue;
+      inboundOutbox.set(record.eventId, {
+        eventId: record.eventId,
+        payload: record.payload,
+        queuedAt: optionalString(record.queuedAt) || new Date().toISOString(),
+      });
+    }
+  }
+
+  const storedReceipts = await readJSONFile(outboundReceiptsPath, []);
+  if (Array.isArray(storedReceipts)) {
+    for (const receipt of storedReceipts) {
+      if (!receipt || typeof receipt !== "object") continue;
+      const clientMessageId = optionalString(receipt.clientMessageId);
+      if (!clientMessageId) continue;
+      const normalized = {
+        clientMessageId,
+        externalMessageId: optionalString(receipt.externalMessageId),
+        sentAt: optionalString(receipt.sentAt) || new Date().toISOString(),
+      };
+      outboundReceipts.set(clientMessageId, normalized);
+    }
+  }
+}
+
+async function readJSONFile(filePath, fallback) {
+  try {
+    return JSON.parse(await readFile(filePath, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[facebook] cannot read ${path.basename(filePath)}:`, error instanceof Error ? error.message : String(error));
+    }
+    return fallback;
+  }
+}
+
+async function atomicWriteJSON(filePath, value) {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
+  await rename(tempPath, filePath);
+}
+
 function readJSON(request, limit) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -338,6 +739,16 @@ function rejectPending(error) { for (const waiter of pending.values()) { clearTi
 function json(response, statusCode, value) { response.writeHead(statusCode, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }); response.end(JSON.stringify(value)); }
 class HTTPError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
+await loadRealtimeState();
+if (inboundOutbox.size) void drainInboundOutbox();
 const stored = await loadSession();
-if (stored) void startBridge(stored).catch((error) => { phase = "error"; lastError = error.message; console.error("[facebook] auto-login failed", error); });
+if (stored) {
+  activeCookies = stored;
+  void startBridge(stored).catch((error) => {
+    phase = "error";
+    lastError = error instanceof Error ? error.message : String(error);
+    console.error("[facebook] auto-login failed", error);
+    scheduleReconnect();
+  });
+}
 server.listen(config.port, config.host, () => console.log(`[facebook-connector] listening on ${config.host}:${config.port}`));

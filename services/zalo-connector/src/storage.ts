@@ -8,6 +8,22 @@ export interface OutboundReceipt {
   sentAt: string;
 }
 
+export interface PendingInboundRecord {
+  eventId: string;
+  payload: unknown;
+  queuedAt: string;
+}
+
+export interface RealtimeCheckpoint {
+  lastEventId?: string;
+  lastMessageId?: string;
+  lastThreadId?: string;
+  lastEventAt?: string;
+  lastConnectedAt?: string;
+  lastDisconnectedAt?: string;
+  recentEventIds: string[];
+}
+
 export async function ensureDataDir(dataDir: string): Promise<void> {
   await fs.mkdir(dataDir, { recursive: true, mode: 0o700 });
 }
@@ -63,6 +79,48 @@ export async function appendDeadLetter(dataDir: string, payload: unknown, error:
     payload,
   });
   await fs.appendFile(path.join(dataDir, "dead-letter.jsonl"), `${line}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+export async function loadInboundOutbox(dataDir: string): Promise<PendingInboundRecord[]> {
+  try {
+    const raw = await fs.readFile(path.join(dataDir, "inbound-outbox.json"), "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((value): value is PendingInboundRecord =>
+      Boolean(value) &&
+      typeof value === "object" &&
+      typeof (value as PendingInboundRecord).eventId === "string" &&
+      typeof (value as PendingInboundRecord).queuedAt === "string" &&
+      "payload" in (value as object)
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+export async function saveInboundOutbox(dataDir: string, records: PendingInboundRecord[]): Promise<void> {
+  await atomicWrite(path.join(dataDir, "inbound-outbox.json"), JSON.stringify(records, null, 2));
+}
+
+export async function loadRealtimeCheckpoint(dataDir: string): Promise<RealtimeCheckpoint> {
+  try {
+    const raw = await fs.readFile(path.join(dataDir, "realtime-checkpoint.json"), "utf8");
+    const parsed = JSON.parse(raw) as Partial<RealtimeCheckpoint>;
+    return {
+      ...parsed,
+      recentEventIds: Array.isArray(parsed.recentEventIds)
+        ? parsed.recentEventIds.filter((value): value is string => typeof value === "string").slice(0, 500)
+        : [],
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { recentEventIds: [] };
+    throw error;
+  }
+}
+
+export async function saveRealtimeCheckpoint(dataDir: string, checkpoint: RealtimeCheckpoint): Promise<void> {
+  await atomicWrite(path.join(dataDir, "realtime-checkpoint.json"), JSON.stringify(checkpoint, null, 2));
 }
 
 async function atomicWrite(filePath: string, content: string): Promise<void> {

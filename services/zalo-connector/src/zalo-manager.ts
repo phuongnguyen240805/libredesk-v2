@@ -7,15 +7,27 @@ import {
   Zalo,
 } from "zca-js";
 import type { API, Credentials, Message } from "zca-js";
-import { pushInboundToCustomerCare } from "./customer-care.js";
+import {
+  pushDeliveryStatusToCustomerCare,
+  pushInboundToCustomerCare,
+  type CustomerCareConnectorEvent,
+  type NormalizedDeliveryStatus,
+  type NormalizedZaloInbound,
+} from "./customer-care.js";
 import {
   clearCredentials,
   ensureDataDir,
   loadCredentials,
+  loadInboundOutbox,
   loadOutboundReceipts,
+  loadRealtimeCheckpoint,
   saveCredentials,
+  saveInboundOutbox,
   saveOutboundReceipts,
+  saveRealtimeCheckpoint,
   type OutboundReceipt,
+  type PendingInboundRecord,
+  type RealtimeCheckpoint,
 } from "./storage.js";
 
 export type ConnectorPhase =
@@ -31,8 +43,11 @@ export interface ConnectorStatus {
   account_id: string;
   profile?: unknown;
   last_connected_at?: string;
+  last_disconnected_at?: string;
   last_message_at?: string;
   last_error?: string;
+  reconnect_attempts: number;
+  pending_event_count: number;
   qr_available: boolean;
 }
 
@@ -52,15 +67,24 @@ export class ZaloManager {
   private phase: ConnectorPhase = "starting";
   private profile?: unknown;
   private lastConnectedAt?: string;
+  private lastDisconnectedAt?: string;
   private lastMessageAt?: string;
   private lastError?: string;
   private connecting = false;
   private reconnectEnabled = true;
   private reconnectTimer?: NodeJS.Timeout;
+  private reconnectAttempts = 0;
+  private outboxRetryTimer?: NodeJS.Timeout;
   private readonly profileCache = new Map<string, CachedProfile>();
   private readonly outboundReceipts = new Map<string, OutboundReceipt>();
   private readonly outboundInFlight = new Map<string, Promise<{ externalMessageId?: string }>>();
+  private readonly inboundOutbox = new Map<string, PendingInboundRecord>();
+  private readonly recentInboundEvents = new Set<string>();
   private outboundPersistQueue: Promise<void> = Promise.resolve();
+  private inboundPersistQueue: Promise<void> = Promise.resolve();
+  private checkpointPersistQueue: Promise<void> = Promise.resolve();
+  private inboundDeliveryQueue: Promise<void> = Promise.resolve();
+  private checkpoint: RealtimeCheckpoint = { recentEventIds: [] };
   private accountId: string;
   private readonly qrPath: string;
 
@@ -74,6 +98,17 @@ export class ZaloManager {
     for (const receipt of await loadOutboundReceipts(this.options.dataDir)) {
       this.outboundReceipts.set(receipt.clientMessageId, receipt);
     }
+    this.checkpoint = await loadRealtimeCheckpoint(this.options.dataDir);
+    for (const eventId of this.checkpoint.recentEventIds) {
+      this.recentInboundEvents.add(eventId);
+    }
+    this.lastConnectedAt = this.checkpoint.lastConnectedAt;
+    this.lastDisconnectedAt = this.checkpoint.lastDisconnectedAt;
+    this.lastMessageAt = this.checkpoint.lastEventAt;
+    for (const record of await loadInboundOutbox(this.options.dataDir)) {
+      this.inboundOutbox.set(record.eventId, record);
+    }
+    if (this.inboundOutbox.size) void this.drainInboundOutbox();
     void this.connect();
   }
 
@@ -83,8 +118,11 @@ export class ZaloManager {
       account_id: this.accountId,
       profile: toJSONSafe(this.profile),
       last_connected_at: this.lastConnectedAt,
+      last_disconnected_at: this.lastDisconnectedAt,
       last_message_at: this.lastMessageAt,
       last_error: this.lastError,
+      reconnect_attempts: this.reconnectAttempts,
+      pending_event_count: this.inboundOutbox.size,
       qr_available: this.phase === "qr_ready" && existsSync(this.qrPath),
     };
   }
@@ -180,6 +218,7 @@ export class ZaloManager {
     this.reconnectEnabled = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    this.reconnectAttempts = 0;
 
     const api = this.api;
     this.api = undefined;
@@ -284,7 +323,7 @@ export class ZaloManager {
       this.phase = "error";
       this.lastError = error instanceof Error ? error.message : String(error);
       console.error("[zalo] connection failed:", error);
-      this.scheduleReconnect(10_000);
+      this.scheduleReconnect();
     } finally {
       this.connecting = false;
     }
@@ -299,27 +338,60 @@ export class ZaloManager {
       }
     });
 
+    // zca-js 2.1.2 exposes native delivery/read receipts. They are sent through
+    // the same durable connector outbox as messages, but to a dedicated Nest DTO.
+    api.listener.on("delivered_messages", (messages) => {
+      for (const receipt of messages) {
+        void this.handleDeliveryReceipt(receipt, "delivered").catch((error) => {
+          console.error("[zalo] delivered receipt processing failed:", error);
+        });
+      }
+    });
+
+    api.listener.on("seen_messages", (messages) => {
+      for (const receipt of messages) {
+        void this.handleDeliveryReceipt(receipt, "read").catch((error) => {
+          console.error("[zalo] seen receipt processing failed:", error);
+        });
+      }
+    });
+
     api.listener.on("connected", () => {
       this.phase = "connected";
+      this.reconnectAttempts = 0;
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
       this.lastConnectedAt = new Date().toISOString();
       this.lastError = undefined;
+      this.checkpoint.lastConnectedAt = this.lastConnectedAt;
+      void this.persistCheckpoint();
       void fs.rm(this.qrPath, { force: true });
-      console.log("[zalo] listener connected");
+      void this.drainInboundOutbox();
+      console.log("[zalo][trace] listener.connected", {
+        accountId: this.accountId,
+        pendingEvents: this.inboundOutbox.size,
+      });
     });
 
     api.listener.on("disconnected", (code, reason) => {
       this.phase = "disconnected";
+      this.lastDisconnectedAt = new Date().toISOString();
       this.lastError = `socket disconnected (${code})${reason ? `: ${reason}` : ""}`;
-      console.warn("[zalo] listener disconnected", { code, reason });
+      this.checkpoint.lastDisconnectedAt = this.lastDisconnectedAt;
+      void this.persistCheckpoint();
+      console.warn("[zalo][trace] listener.disconnected", { code, reason });
     });
 
     api.listener.on("closed", (code, reason) => {
       if (this.api === api) this.api = undefined;
       this.phase = "disconnected";
+      this.lastDisconnectedAt = new Date().toISOString();
       this.lastError = `socket closed (${code})${reason ? `: ${reason}` : ""}`;
+      this.checkpoint.lastDisconnectedAt = this.lastDisconnectedAt;
+      void this.persistCheckpoint();
       if (this.reconnectEnabled) {
-        console.warn("[zalo] listener closed; scheduling reconnect", { code, reason });
-        this.scheduleReconnect(5_000);
+        console.warn("[zalo][trace] listener.closed", { code, reason });
+        this.scheduleReconnect();
       }
     });
 
@@ -347,15 +419,19 @@ export class ZaloManager {
         `${externalThreadId}-${event.data.ts || Date.now()}`,
     );
 
-    // A message sent from the CSKH UI is already persisted by Nest/LibreDesk.
-    // zca-js can echo that same outgoing message back through the listener.
-    // Skip the echo to avoid duplicate/loop.
-    if (isSelf && this.isKnownConnectorOutbound(rawMessageId)) {
-      console.log("[zalo][trace] self.echo.skip", {
+    // Keep connector-originated self echoes instead of dropping them. The
+    // client_message_id lets Nest reconcile the native ACK with the optimistic
+    // CSKH message exactly; self messages sent from the Zalo app have no receipt
+    // and are therefore inserted as real outgoing conversation events.
+    const connectorOutbound = isSelf
+      ? this.findConnectorOutbound(rawMessageId)
+      : undefined;
+    if (connectorOutbound) {
+      console.log("[zalo][trace] self.echo.detected", {
         threadId: externalThreadId,
         messageId: rawMessageId,
+        clientMessageId: connectorOutbound.clientMessageId,
       });
-      return;
     }
 
     const externalMessageId = `${this.accountId}:${rawMessageId}`;
@@ -387,7 +463,7 @@ export class ZaloManager {
         ? `Nhóm Zalo ${externalThreadId}`
         : `Khách Zalo ${peerExternalId}`);
 
-    const payload = {
+    const payload: NormalizedZaloInbound = {
       event_id: `${this.accountId}:${direction}:message:${rawMessageId}`,
       provider: "zalo_personal" as const,
       account_id: this.accountId,
@@ -395,6 +471,9 @@ export class ZaloManager {
       is_self: isSelf,
       external_thread_id: externalThreadId,
       external_message_id: externalMessageId,
+      ...(connectorOutbound?.clientMessageId
+        ? { client_message_id: connectorOutbound.clientMessageId }
+        : {}),
       thread_type: threadType,
       occurred_at: normalizeOccurredAt(event.data.ts),
       sender: {
@@ -419,44 +498,189 @@ export class ZaloManager {
       peerId: peerExternalId,
     });
 
-    console.log("[zalo][trace] webhook.start", {
-      eventId: payload.event_id,
-    });
-
-    try {
-      const result = await pushInboundToCustomerCare(payload, {
-        connectionKey: this.options.connectionKey,
-        dataDir: this.options.dataDir,
-        webhookURL: this.options.webhookURL,
-        webhookSecret: this.options.webhookSecret,
-        retryCount: this.options.retryCount,
-        retryBaseMs: this.options.retryBaseMs,
-      });
-      console.log("[zalo][trace] webhook.ok", {
-        eventId: payload.event_id,
-        conversationUuid: result.conversation_uuid,
-        messageUuid: result.message_uuid,
-      });
-      this.lastMessageAt = new Date().toISOString();
-    } catch (error) {
-      console.error("[zalo][trace] webhook.failed", {
-        eventId: payload.event_id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
+    await this.enqueueInbound(payload, rawMessageId, externalThreadId);
+    this.lastMessageAt = payload.occurred_at;
   }
 
-  private isKnownConnectorOutbound(rawMessageId: string): boolean {
+  private async handleDeliveryReceipt(
+    receipt: unknown,
+    status: "delivered" | "read",
+  ): Promise<void> {
+    if (!receipt || typeof receipt !== "object") return;
+    const record = receipt as Record<string, unknown>;
+    const data = record.data && typeof record.data === "object"
+      ? record.data as Record<string, unknown>
+      : {};
+    const threadId = stringValue(record.threadId) || stringValue(data.groupId) || stringValue(data.idTo);
+    if (!threadId) return;
+
+    // Zalo receipts may expose both msgId and realMsgId. Keep both because the
+    // send ACK and listener echo can use different native IDs depending on chat type.
+    const rawIds = [...new Set([stringValue(data.realMsgId), stringValue(data.msgId)].filter(Boolean))];
+    if (!rawIds.length) return;
+    const externalIds = rawIds.map((id) => `${this.accountId}:${id}`);
+    const connectorOutbound = rawIds
+      .map((id) => this.findConnectorOutbound(id))
+      .find((value): value is OutboundReceipt => Boolean(value));
+    const occurredAt = normalizeOccurredAt(data.mSTs ?? Date.now());
+    const payload: NormalizedDeliveryStatus = {
+      event_id: `${this.accountId}:delivery:${status}:${threadId}:${rawIds.join(",")}`,
+      event_type: "delivery_status",
+      provider: "zalo_personal",
+      account_id: this.accountId,
+      external_thread_id: threadId,
+      external_message_id: externalIds[0],
+      external_message_ids: externalIds,
+      ...(connectorOutbound?.clientMessageId
+        ? { client_message_id: connectorOutbound.clientMessageId }
+        : {}),
+      status,
+      occurred_at: occurredAt,
+    };
+
+    console.log("[zalo][trace] delivery.detected", {
+      eventId: payload.event_id, status, threadId, externalMessageIds: externalIds,
+    });
+    await this.enqueueInbound(payload, rawIds[0], threadId);
+  }
+
+  private findConnectorOutbound(rawMessageId: string): OutboundReceipt | undefined {
     const needle = String(rawMessageId).trim();
-    if (!needle) return false;
+    if (!needle) return undefined;
 
     for (const receipt of this.outboundReceipts.values()) {
       const id = String(receipt.externalMessageId || "").trim();
       if (!id) continue;
-      if (id === needle || id.endsWith(`:${needle}`)) return true;
+      if (id === needle || id.endsWith(`:${needle}`)) return receipt;
     }
-    return false;
+    return undefined;
+  }
+
+  private async enqueueInbound(
+    payload: CustomerCareConnectorEvent,
+    rawMessageId: string,
+    threadId: string,
+  ): Promise<void> {
+    if (this.recentInboundEvents.has(payload.event_id)) {
+      console.log("[zalo][trace] event.duplicate.skip", { eventId: payload.event_id });
+      return;
+    }
+
+    if (!this.inboundOutbox.has(payload.event_id)) {
+      this.inboundOutbox.set(payload.event_id, {
+        eventId: payload.event_id,
+        payload,
+        queuedAt: new Date().toISOString(),
+      });
+    }
+
+    this.checkpoint.lastEventId = payload.event_id;
+    this.checkpoint.lastMessageId = rawMessageId;
+    this.checkpoint.lastThreadId = threadId;
+    this.checkpoint.lastEventAt = payload.occurred_at;
+    await Promise.all([this.persistInboundOutbox(), this.persistCheckpoint()]);
+    void this.drainInboundOutbox();
+  }
+
+  private persistInboundOutbox(): Promise<void> {
+    this.inboundPersistQueue = this.inboundPersistQueue
+      .catch(() => undefined)
+      .then(() =>
+        saveInboundOutbox(
+          this.options.dataDir,
+          [...this.inboundOutbox.values()].sort((a, b) =>
+            a.queuedAt.localeCompare(b.queuedAt),
+          ),
+        ),
+      );
+    return this.inboundPersistQueue;
+  }
+
+  private persistCheckpoint(): Promise<void> {
+    this.checkpointPersistQueue = this.checkpointPersistQueue
+      .catch(() => undefined)
+      .then(() => saveRealtimeCheckpoint(this.options.dataDir, this.checkpoint));
+    return this.checkpointPersistQueue;
+  }
+
+  private drainInboundOutbox(): Promise<void> {
+    this.inboundDeliveryQueue = this.inboundDeliveryQueue
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.outboxRetryTimer) {
+          clearTimeout(this.outboxRetryTimer);
+          this.outboxRetryTimer = undefined;
+        }
+
+        const records = [...this.inboundOutbox.values()].sort((a, b) =>
+          a.queuedAt.localeCompare(b.queuedAt),
+        );
+        for (const record of records) {
+          const payload = record.payload as CustomerCareConnectorEvent;
+          console.log("[zalo][trace] webhook.start", {
+            eventId: payload.event_id,
+            pendingEvents: this.inboundOutbox.size,
+          });
+          try {
+            const context = {
+              connectionKey: this.options.connectionKey,
+              dataDir: this.options.dataDir,
+              webhookURL: this.options.webhookURL,
+              webhookSecret: this.options.webhookSecret,
+              retryCount: this.options.retryCount,
+              retryBaseMs: this.options.retryBaseMs,
+            };
+            const result = "event_type" in payload && payload.event_type === "delivery_status"
+              ? await pushDeliveryStatusToCustomerCare(payload, context)
+              : await pushInboundToCustomerCare(payload, context);
+            this.inboundOutbox.delete(record.eventId);
+            this.rememberProcessedEvent(record.eventId);
+            await Promise.all([this.persistInboundOutbox(), this.persistCheckpoint()]);
+            console.log("[zalo][trace] webhook.ok", {
+              eventId: payload.event_id,
+              conversationUuid: result.conversation_uuid,
+              ...("message_uuid" in result ? { messageUuid: result.message_uuid } : {}),
+              ...("duplicate" in result ? { duplicate: result.duplicate } : {}),
+              ...("updated" in result ? { updated: result.updated, ignored: result.ignored } : {}),
+              pendingEvents: this.inboundOutbox.size,
+            });
+          } catch (error) {
+            this.lastError = `webhook delivery failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+            console.error("[zalo][trace] webhook.pending", {
+              eventId: payload.event_id,
+              pendingEvents: this.inboundOutbox.size,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            this.scheduleOutboxRetry();
+            break;
+          }
+        }
+      });
+    return this.inboundDeliveryQueue;
+  }
+
+  private rememberProcessedEvent(eventId: string): void {
+    this.recentInboundEvents.add(eventId);
+    const recent = [
+      eventId,
+      ...this.checkpoint.recentEventIds.filter((value) => value !== eventId),
+    ].slice(0, 500);
+    this.checkpoint.recentEventIds = recent;
+    const keep = new Set(recent);
+    for (const value of this.recentInboundEvents) {
+      if (!keep.has(value)) this.recentInboundEvents.delete(value);
+    }
+  }
+
+  private scheduleOutboxRetry(): void {
+    if (this.outboxRetryTimer || !this.inboundOutbox.size) return;
+    this.outboxRetryTimer = setTimeout(() => {
+      this.outboxRetryTimer = undefined;
+      void this.drainInboundOutbox();
+    }, 15_000);
+    this.outboxRetryTimer.unref();
   }
 
   private async getUserProfile(userId: string): Promise<{ displayName: string; avatarUrl: string }> {
@@ -493,13 +717,23 @@ export class ZaloManager {
     await saveCredentials(this.options.dataDir, credentials);
   }
 
-  private scheduleReconnect(delayMs: number): void {
-    if (!this.reconnectEnabled) return;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+  private scheduleReconnect(delayMs?: number): void {
+    if (!this.reconnectEnabled || this.reconnectTimer) return;
+    let resolvedDelay = delayMs;
+    if (resolvedDelay == null) {
+      this.reconnectAttempts += 1;
+      const base = Math.min(60_000, 1_000 * 2 ** Math.min(this.reconnectAttempts - 1, 6));
+      const jitter = Math.floor(base * Math.random() * 0.25);
+      resolvedDelay = Math.min(60_000, base + jitter);
+    }
+    console.log("[zalo][trace] reconnect.scheduled", {
+      attempt: this.reconnectAttempts,
+      delayMs: resolvedDelay,
+    });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       void this.connect();
-    }, delayMs);
+    }, resolvedDelay);
     this.reconnectTimer.unref();
   }
 }

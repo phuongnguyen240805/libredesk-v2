@@ -1,5 +1,4 @@
 import { createHmac } from "node:crypto";
-import { appendDeadLetter } from "./storage.js";
 
 export interface NormalizedZaloInbound {
   event_id: string;
@@ -9,6 +8,7 @@ export interface NormalizedZaloInbound {
   is_self: boolean;
   external_thread_id: string;
   external_message_id: string;
+  client_message_id?: string;
   thread_type: "user" | "group";
   occurred_at: string;
   sender: {
@@ -22,20 +22,74 @@ export interface NormalizedZaloInbound {
   };
 }
 
+export type CustomerCareDeliveryStatus = "delivered" | "read";
+
+export interface NormalizedDeliveryStatus {
+  event_id: string;
+  event_type: "delivery_status";
+  provider: "zalo_personal" | "facebook_personal";
+  account_id: string;
+  external_thread_id: string;
+  external_message_id?: string;
+  external_message_ids?: string[];
+  client_message_id?: string;
+  status: CustomerCareDeliveryStatus;
+  occurred_at: string;
+  /** For Facebook Lightspeed readReceipt: all outgoing messages <= watermark are read. */
+  watermark_at?: string;
+}
+
+export type CustomerCareConnectorEvent = NormalizedZaloInbound | NormalizedDeliveryStatus;
+
 export interface CustomerCareInboundResult {
   message_uuid?: string;
   conversation_uuid: string;
   duplicate?: boolean;
 }
 
-/**
- * Sends normalized Zalo events to the Nest Customer Care gateway.
- * The connector no longer knows LibreDesk credentials or conversation UUIDs.
- */
+export interface CustomerCareDeliveryResult {
+  conversation_uuid?: string;
+  updated: number;
+  ignored: number;
+}
+
+export interface CustomerCareWebhookContext {
+  connectionKey: string;
+  dataDir: string;
+  webhookURL: string;
+  webhookSecret: string;
+  retryCount: number;
+  retryBaseMs: number;
+}
+
+/** Send a normalized message event to Nest Customer Care. */
 export async function pushInboundToCustomerCare(
   payload: NormalizedZaloInbound,
-  context: { connectionKey: string; dataDir: string; webhookURL: string; webhookSecret: string; retryCount: number; retryBaseMs: number },
+  context: CustomerCareWebhookContext,
 ): Promise<CustomerCareInboundResult> {
+  const decoded = await postSigned(payload, context, "events", "zalo");
+  const result = unwrapInboundEnvelope(decoded);
+  if (!result.conversation_uuid) {
+    throw new Error("Customer Care gateway response is missing conversation_uuid");
+  }
+  return result;
+}
+
+/** Send delivered/read receipts without mixing them into the message DTO. */
+export async function pushDeliveryStatusToCustomerCare(
+  payload: NormalizedDeliveryStatus,
+  context: CustomerCareWebhookContext,
+): Promise<CustomerCareDeliveryResult> {
+  const decoded = await postSigned(payload, context, "delivery", "zalo");
+  return unwrapDeliveryEnvelope(decoded);
+}
+
+async function postSigned(
+  payload: { event_id: string },
+  context: CustomerCareWebhookContext,
+  endpoint: "events" | "delivery",
+  logPrefix: string,
+): Promise<unknown> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= context.retryCount; attempt += 1) {
@@ -48,11 +102,9 @@ export async function pushInboundToCustomerCare(
       const signature = createHmac("sha256", channelSecret)
         .update(`${timestamp}.${body}`)
         .digest("hex");
+      const url = connectorEndpoint(context.webhookURL, context.connectionKey, endpoint);
 
-      const webhookBase = context.webhookURL
-        .replace(/\/(?:zalo\/)?events\/?$/, "")
-        .replace(/\/$/, "");
-      const response = await fetch(`${webhookBase}/channels/${context.connectionKey}/events`, {
+      const response = await fetch(url, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -64,39 +116,18 @@ export async function pushInboundToCustomerCare(
       });
 
       const text = await response.text();
-      console.log("[zalo][trace] webhook.response", {
-        eventId: payload.event_id,
-        direction: payload.direction,
-        attempt,
-        status: response.status,
-        ok: response.ok,
+      console.log(`[${logPrefix}][trace] webhook.response`, {
+        eventId: payload.event_id, endpoint, attempt, status: response.status, ok: response.ok,
       });
 
       let decoded: unknown = {};
       if (text) {
-        try {
-          decoded = JSON.parse(text);
-        } catch {
-          decoded = { raw: text };
-        }
+        try { decoded = JSON.parse(text); } catch { decoded = { raw: text }; }
       }
-
       if (!response.ok) {
-        console.error("[zalo][trace] webhook.reject", {
-          eventId: payload.event_id,
-          direction: payload.direction,
-          attempt,
-          status: response.status,
-          response: text.slice(0, 500),
-        });
         throw new Error(`Customer Care gateway returned HTTP ${response.status}: ${text.slice(0, 500)}`);
       }
-
-      const result = unwrapEnvelope(decoded);
-      if (!result.conversation_uuid) {
-        throw new Error("Customer Care gateway response is missing conversation_uuid");
-      }
-      return result;
+      return decoded;
     } catch (error) {
       lastError = error;
       if (attempt < context.retryCount) {
@@ -105,29 +136,44 @@ export async function pushInboundToCustomerCare(
     }
   }
 
-  await appendDeadLetter(context.dataDir, payload, lastError);
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-function unwrapEnvelope(value: unknown): CustomerCareInboundResult {
-  if (!value || typeof value !== "object") {
-    throw new Error("Invalid Customer Care gateway response");
-  }
-  const record = value as Record<string, unknown>;
-  let candidate = record;
-  // Nest TransformInterceptor envelope: { code, data, message }
-  if (record.data && typeof record.data === "object") {
-    candidate = record.data as Record<string, unknown>;
-    // Some deployments wrap the controller result one more time.
+function connectorEndpoint(rawURL: string, connectionKey: string, endpoint: "events" | "delivery"): string {
+  const base = rawURL
+    .replace(/\/channels\/[^/]+\/(?:events|delivery)\/?$/, "")
+    .replace(/\/(?:zalo\/)?events\/?$/, "")
+    .replace(/\/$/, "");
+  return `${base}/channels/${connectionKey}/${endpoint}`;
+}
+
+function envelope(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object") return {};
+  let candidate = value as Record<string, unknown>;
+  if (candidate.data && typeof candidate.data === "object") {
+    candidate = candidate.data as Record<string, unknown>;
     if (candidate.data && typeof candidate.data === "object") {
       candidate = candidate.data as Record<string, unknown>;
     }
   }
+  return candidate;
+}
 
+function unwrapInboundEnvelope(value: unknown): CustomerCareInboundResult {
+  const candidate = envelope(value);
   return {
     message_uuid: candidate.message_uuid ? String(candidate.message_uuid) : undefined,
     conversation_uuid: String(candidate.conversation_uuid ?? ""),
     duplicate: Boolean(candidate.duplicate ?? false),
+  };
+}
+
+function unwrapDeliveryEnvelope(value: unknown): CustomerCareDeliveryResult {
+  const candidate = envelope(value);
+  return {
+    conversation_uuid: candidate.conversation_uuid ? String(candidate.conversation_uuid) : undefined,
+    updated: Number(candidate.updated ?? 0),
+    ignored: Number(candidate.ignored ?? 0),
   };
 }
 
