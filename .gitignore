@@ -9,3 +9,10 @@ uploads
 dist/
 .vscode/
 static/widget.min.js
+
+# Production secrets
+.env.production
+
+# Connector runtime/session data
+zalo-data/sessions/
+facebook-data/sessions/

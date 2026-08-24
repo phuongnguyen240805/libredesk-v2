@@ -1,0 +1,88 @@
+# ============================================================
+# Stage 1: Build LibreDesk frontend
+# ============================================================
+FROM node:22-alpine AS frontend-builder
+
+WORKDIR /src/frontend
+
+RUN corepack enable
+
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+
+RUN pnpm install --frozen-lockfile
+
+COPY frontend/ ./
+
+ARG LIBREDESK_VERSION=production
+ENV VITE_APP_VERSION=${LIBREDESK_VERSION}
+
+RUN pnpm build:main \
+    && pnpm build:widget
+
+
+# ============================================================
+# Stage 2: Build LibreDesk Go binary + embed static assets
+# ============================================================
+FROM golang:1.25-alpine AS backend-builder
+
+WORKDIR /src
+
+RUN apk add --no-cache \
+    git \
+    ca-certificates
+
+COPY go.mod go.sum ./
+
+RUN go mod download
+
+COPY . .
+
+# Ghi đè frontend/dist bằng frontend vừa build ở stage trước
+COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
+
+# LibreDesk dùng stuffbin để nhúng:
+# frontend/dist, i18n, schema.sql, static
+RUN go install github.com/knadh/stuffbin/...
+
+ARG LIBREDESK_VERSION=production
+ARG LIBREDESK_BUILD=production
+
+RUN CGO_ENABLED=0 go build -a \
+    -ldflags="-s -w \
+    -X 'main.buildString=${LIBREDESK_BUILD}' \
+    -X 'main.versionString=${LIBREDESK_VERSION}' \
+    -X 'github.com/abhinavxd/libredesk/internal/version.Version=${LIBREDESK_VERSION}'" \
+    -o ./libredesk \
+    cmd/*.go
+
+# QUAN TRỌNG:
+# Nhúng schema + static + frontend vào binary
+RUN /go/bin/stuffbin \
+    -a stuff \
+    -in ./libredesk \
+    -out /out/libredesk \
+    frontend/dist \
+    i18n \
+    schema.sql \
+    static
+
+
+# ============================================================
+# Stage 3: Production runtime
+# ============================================================
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    gettext
+
+WORKDIR /libredesk
+
+COPY --from=backend-builder /out/libredesk ./libredesk
+
+RUN mkdir -p /libredesk/uploads
+
+EXPOSE 9000
+
+CMD ["./libredesk"]

@@ -39,7 +39,21 @@ export interface NormalizedDeliveryStatus {
   watermark_at?: string;
 }
 
-export type CustomerCareConnectorEvent = NormalizedZaloInbound | NormalizedDeliveryStatus;
+
+export interface NormalizedPresenceStatus {
+  event_id: string;
+  event_type: "presence";
+  provider: "zalo_personal" | "facebook_personal";
+  account_id: string;
+  external_thread_id: string;
+  external_user_id: string;
+  state: "online" | "offline" | "unknown";
+  last_active_at?: string;
+  observed_at: string;
+  source: "native" | "native_activity";
+}
+
+export type CustomerCareConnectorEvent = NormalizedZaloInbound | NormalizedDeliveryStatus | NormalizedPresenceStatus;
 
 export interface CustomerCareInboundResult {
   message_uuid?: string;
@@ -48,6 +62,12 @@ export interface CustomerCareInboundResult {
 }
 
 export interface CustomerCareDeliveryResult {
+  conversation_uuid?: string;
+  updated: number;
+  ignored: number;
+}
+
+export interface CustomerCarePresenceResult {
   conversation_uuid?: string;
   updated: number;
   ignored: number;
@@ -84,10 +104,19 @@ export async function pushDeliveryStatusToCustomerCare(
   return unwrapDeliveryEnvelope(decoded);
 }
 
+/** Send normalized customer presence without mixing it into message events. */
+export async function pushPresenceToCustomerCare(
+  payload: NormalizedPresenceStatus,
+  context: CustomerCareWebhookContext,
+): Promise<CustomerCarePresenceResult> {
+  const decoded = await postSigned(payload, context, "presence", "zalo");
+  return unwrapPresenceEnvelope(decoded);
+}
+
 async function postSigned(
   payload: { event_id: string },
   context: CustomerCareWebhookContext,
-  endpoint: "events" | "delivery",
+  endpoint: "events" | "delivery" | "presence",
   logPrefix: string,
 ): Promise<unknown> {
   let lastError: unknown;
@@ -139,9 +168,9 @@ async function postSigned(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-function connectorEndpoint(rawURL: string, connectionKey: string, endpoint: "events" | "delivery"): string {
+function connectorEndpoint(rawURL: string, connectionKey: string, endpoint: "events" | "delivery" | "presence"): string {
   const base = rawURL
-    .replace(/\/channels\/[^/]+\/(?:events|delivery)\/?$/, "")
+    .replace(/\/channels\/[^/]+\/(?:events|delivery|presence)\/?$/, "")
     .replace(/\/(?:zalo\/)?events\/?$/, "")
     .replace(/\/$/, "");
   return `${base}/channels/${connectionKey}/${endpoint}`;
@@ -169,6 +198,15 @@ function unwrapInboundEnvelope(value: unknown): CustomerCareInboundResult {
 }
 
 function unwrapDeliveryEnvelope(value: unknown): CustomerCareDeliveryResult {
+  const candidate = envelope(value);
+  return {
+    conversation_uuid: candidate.conversation_uuid ? String(candidate.conversation_uuid) : undefined,
+    updated: Number(candidate.updated ?? 0),
+    ignored: Number(candidate.ignored ?? 0),
+  };
+}
+
+function unwrapPresenceEnvelope(value: unknown): CustomerCarePresenceResult {
   const candidate = envelope(value);
   return {
     conversation_uuid: candidate.conversation_uuid ? String(candidate.conversation_uuid) : undefined,

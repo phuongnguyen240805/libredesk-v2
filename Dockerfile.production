@@ -1,0 +1,79 @@
+# ============================================================
+# Stage 1: Build frontend
+# ============================================================
+FROM node:22-alpine AS frontend-builder
+
+WORKDIR /src/frontend
+
+RUN corepack enable
+
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+
+RUN pnpm install --frozen-lockfile
+
+COPY frontend/ ./
+
+ARG LIBREDESK_VERSION=production
+ENV VITE_APP_VERSION=${LIBREDESK_VERSION}
+
+RUN pnpm build:main && pnpm build:widget
+
+
+# ============================================================
+# Stage 2: Build backend + embed production assets
+# ============================================================
+FROM golang:1.25-alpine AS backend-builder
+
+WORKDIR /src
+
+RUN apk add --no-cache \
+    git \
+    ca-certificates \
+    make
+
+COPY go.mod go.sum ./
+
+RUN go mod download
+
+COPY . .
+
+# Dùng frontend vừa build ở stage 1
+COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
+
+ARG LIBREDESK_VERSION=production
+ARG LIBREDESK_BUILD=production
+
+# Kiểm tra asset trước khi build
+RUN test -f schema.sql \
+    && test -d i18n \
+    && test -d static \
+    && test -d frontend/dist
+
+# Build backend + stuff assets theo đúng Makefile của LibreDesk
+RUN LIBREDESK_VERSION="${LIBREDESK_VERSION}" \
+    make build-backend stuff
+
+# Kiểm tra binary đã được stuff
+RUN /go/bin/stuffbin -a id -in ./libredesk
+
+
+# ============================================================
+# Stage 3: Runtime
+# ============================================================
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    gettext
+
+WORKDIR /libredesk
+
+COPY --from=backend-builder /src/libredesk ./libredesk
+
+RUN chmod +x ./libredesk \
+    && mkdir -p /libredesk/uploads
+
+EXPOSE 9000
+
+CMD ["./libredesk", "--config", "/libredesk/config.toml"]

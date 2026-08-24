@@ -49,6 +49,9 @@ const inboundOutbox = new Map();
 const recentInboundEvents = new Set();
 const intentionalStops = new WeakSet();
 const contactProfiles = new Map();
+const peerPresence = new Map();
+const presenceOfflineTimers = new Map();
+const FACEBOOK_ACTIVITY_ONLINE_TTL_MS = positiveInt("FACEBOOK_ACTIVITY_ONLINE_TTL_MS", 90_000);
 const PROFILE_TTL_MS = 6 * 60 * 60 * 1000;
 const PROFILE_ERROR_TTL_MS = 5 * 60 * 1000;
 
@@ -91,6 +94,34 @@ async function startBridge(cookies) {
   const connected = await rpc("connect", {});
   profile = connected?.user;
   actualFacebookId = String(profile?.id || cookies.c_user || "");
+
+  // The connect response does not always carry the profile picture. Resolve the
+  // connected Facebook account itself so /status exposes a stable avatarUrl
+  // that the CSKH UI can use for outgoing bubbles.
+  if (/^\d+$/.test(actualFacebookId)) {
+    try {
+      const selfInfo = await rpc("getUserInfo", { userId: Number(actualFacebookId) }, 15_000);
+      profile = {
+        ...(profile && typeof profile === "object" ? profile : {}),
+        ...(selfInfo && typeof selfInfo === "object" ? selfInfo : {}),
+        id: actualFacebookId,
+        name: String(selfInfo?.name || profile?.name || "").trim() || undefined,
+        avatarUrl: String(
+          selfInfo?.profilePictureUrl ||
+          selfInfo?.avatarUrl ||
+          profile?.avatarUrl ||
+          profile?.profilePictureUrl ||
+          ""
+        ).trim() || undefined,
+      };
+    } catch (error) {
+      console.warn(
+        "[facebook] unable to hydrate connected account profile:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   await rpc("connectE2EE", {});
   markConnected();
 }
@@ -190,6 +221,7 @@ async function handleBridgeEvent(event) {
     lastError = event.data?.message || "Facebook bridge disconnected";
     checkpoint.lastDisconnectedAt = lastDisconnectedAt;
     void persistCheckpoint();
+    void markFacebookPresenceUnknown();
     console.warn("[facebook][trace] disconnected", { error: lastError });
     scheduleReconnect();
     return;
@@ -226,6 +258,11 @@ async function handleBridgeEvent(event) {
   if (!text) return;
   const accountId = actualFacebookId || config.accountId;
   const occurredAt = new Date(Number(data.timestampMs || event.timestamp || Date.now())).toISOString();
+  if (!isSelf && threadType === "user") {
+    void markFacebookPeerActive(threadId, contactId, occurredAt).catch((error) => {
+      console.warn("[facebook] presence activity update failed:", error instanceof Error ? error.message : String(error));
+    });
+  }
   const payload = {
     event_id: `${accountId}:${isSelf ? "outgoing" : "incoming"}:message:${messageId}`,
     provider: "facebook_personal",
@@ -274,6 +311,10 @@ async function handleFacebookReadReceipt(event) {
   if (readerId && actualFacebookId && readerId === actualFacebookId) return;
 
   const occurredMs = Number(data.timestampMs || event.timestamp || Date.now());
+  const occurredAt = new Date(Number.isFinite(occurredMs) ? occurredMs : Date.now()).toISOString();
+  void markFacebookPeerActive(threadId, readerId || threadId, occurredAt).catch((error) => {
+    console.warn("[facebook] read presence update failed:", error instanceof Error ? error.message : String(error));
+  });
   const payload = {
     event_id: `${accountId}:delivery:read:${threadId}:watermark:${watermarkMs}:${readerId || "peer"}`,
     event_type: "delivery_status",
@@ -281,7 +322,7 @@ async function handleFacebookReadReceipt(event) {
     account_id: accountId,
     external_thread_id: threadId,
     status: "read",
-    occurred_at: new Date(Number.isFinite(occurredMs) ? occurredMs : Date.now()).toISOString(),
+    occurred_at: occurredAt,
     watermark_at: new Date(watermarkMs).toISOString(),
   };
   console.log("[facebook][trace] delivery.detected", {
@@ -310,6 +351,12 @@ async function handleFacebookE2EEReceipt(event) {
   const externalIds = rawIds.map((id) => `${accountId}:${id}`);
   const connectorOutbound = rawIds.map((id) => findOutboundReceipt(id)).find(Boolean);
   const occurredMs = Number(event.timestamp || Date.now());
+  const occurredAt = new Date(Number.isFinite(occurredMs) ? occurredMs : Date.now()).toISOString();
+  if (status === "read") {
+    void markFacebookPeerActive(threadId, senderId || threadId, occurredAt).catch((error) => {
+      console.warn("[facebook] e2ee presence update failed:", error instanceof Error ? error.message : String(error));
+    });
+  }
   const payload = {
     event_id: `${accountId}:delivery:${status}:${threadId}:${rawIds.join(",")}`,
     event_type: "delivery_status",
@@ -320,12 +367,79 @@ async function handleFacebookE2EEReceipt(event) {
     external_message_ids: externalIds,
     ...(connectorOutbound?.clientMessageId ? { client_message_id: connectorOutbound.clientMessageId } : {}),
     status,
-    occurred_at: new Date(Number.isFinite(occurredMs) ? occurredMs : Date.now()).toISOString(),
+    occurred_at: occurredAt,
   };
   console.log("[facebook][trace] delivery.detected", {
     eventId: payload.event_id, status, threadId, externalMessageIds: externalIds, receiptType,
   });
   await enqueueInbound(payload, rawIds[0], threadId);
+}
+
+async function markFacebookPeerActive(threadId, userId, occurredAt) {
+  const normalizedThreadId = String(threadId || "").trim();
+  const normalizedUserId = String(userId || normalizedThreadId).trim();
+  if (!normalizedThreadId || !normalizedUserId || normalizedUserId === actualFacebookId) return;
+
+  const lastActiveAt = safeISO(occurredAt);
+  const current = peerPresence.get(normalizedThreadId);
+  if (!current || current.state !== "online" || current.lastActiveAt !== lastActiveAt) {
+    peerPresence.set(normalizedThreadId, { state: "online", lastActiveAt });
+    await enqueueFacebookPresence(normalizedThreadId, normalizedUserId, "online", lastActiveAt);
+  }
+
+  const existingTimer = presenceOfflineTimers.get(normalizedThreadId);
+  if (existingTimer) clearTimeout(existingTimer);
+  const timer = setTimeout(() => {
+    presenceOfflineTimers.delete(normalizedThreadId);
+    const latest = peerPresence.get(normalizedThreadId);
+    if (!latest) return;
+    peerPresence.set(normalizedThreadId, { state: "offline", lastActiveAt: latest.lastActiveAt });
+    void enqueueFacebookPresence(normalizedThreadId, normalizedUserId, "offline", latest.lastActiveAt)
+      .catch((error) => console.warn("[facebook] presence offline update failed:", error instanceof Error ? error.message : String(error)));
+  }, FACEBOOK_ACTIVITY_ONLINE_TTL_MS);
+  timer.unref();
+  presenceOfflineTimers.set(normalizedThreadId, timer);
+}
+
+async function markFacebookPresenceUnknown() {
+  for (const timer of presenceOfflineTimers.values()) clearTimeout(timer);
+  presenceOfflineTimers.clear();
+  const entries = [...peerPresence.entries()];
+  for (const [threadId, current] of entries) {
+    if (current.state === "unknown") continue;
+    peerPresence.set(threadId, { state: "unknown", lastActiveAt: current.lastActiveAt });
+    await enqueueFacebookPresence(threadId, threadId, "unknown", current.lastActiveAt);
+  }
+}
+
+async function enqueueFacebookPresence(threadId, userId, state, lastActiveAt) {
+  const accountId = actualFacebookId || config.accountId;
+  const observedAt = new Date().toISOString();
+  const payload = {
+    event_id: `${accountId}:presence:${threadId}:${state}:${lastActiveAt || observedAt}`,
+    event_type: "presence",
+    provider: "facebook_personal",
+    account_id: accountId,
+    external_thread_id: threadId,
+    external_user_id: userId,
+    state,
+    ...(lastActiveAt ? { last_active_at: lastActiveAt } : {}),
+    observed_at: observedAt,
+    source: "native_activity",
+  };
+  console.log("[facebook][trace] presence.detected", {
+    eventId: payload.event_id,
+    threadId,
+    userId,
+    state,
+    lastActiveAt,
+  });
+  await enqueueInbound(payload, `presence:${userId}`, threadId);
+}
+
+function safeISO(value) {
+  const date = new Date(value || Date.now());
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
 }
 
 async function getFacebookContact(userId) {
@@ -358,7 +472,9 @@ async function pushWebhook(payload) {
       const signature = createHmac("sha256", config.channelSecret).update(`${timestamp}.${body}`).digest("hex");
       const targetURL = payload.event_type === "delivery_status"
         ? config.webhookURL.replace(/\/events\/?$/, "/delivery")
-        : config.webhookURL;
+        : payload.event_type === "presence"
+          ? config.webhookURL.replace(/\/events\/?$/, "/presence")
+          : config.webhookURL;
       const response = await fetch(targetURL, {
         method: "POST",
         headers: { "content-type": "application/json", "x-customer-care-timestamp": timestamp, "x-customer-care-signature": signature },
@@ -388,9 +504,13 @@ async function enqueueInbound(payload, rawMessageId, threadId) {
     });
   }
   checkpoint.lastEventId = payload.event_id;
-  checkpoint.lastMessageId = rawMessageId;
-  checkpoint.lastThreadId = threadId;
-  checkpoint.lastEventAt = payload.occurred_at;
+  if (payload.event_type !== "presence") {
+    checkpoint.lastMessageId = rawMessageId;
+    checkpoint.lastThreadId = threadId;
+  }
+  checkpoint.lastEventAt = payload.event_type === "presence"
+    ? payload.observed_at
+    : payload.occurred_at;
   await Promise.all([persistInboundOutbox(), persistCheckpoint()]);
   void drainInboundOutbox();
 }
@@ -588,6 +708,7 @@ const server = createServer(async (request, response) => {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = undefined;
       await stopBridge(true);
+      await markFacebookPresenceUnknown();
       await Promise.all([rm(sessionPath, { force: true }), rm(devicePath, { force: true })]);
       phase = "disconnected";
       profile = undefined;

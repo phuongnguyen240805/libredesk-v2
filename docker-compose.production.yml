@@ -1,0 +1,228 @@
+name: ${COMPOSE_PROJECT_NAME:-libredesk-prod}
+
+services:
+  app:
+    image: ${LIBREDESK_IMAGE:-libredesk-prod:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+      args:
+        LIBREDESK_VERSION: ${LIBREDESK_VERSION:-production}
+        LIBREDESK_BUILD: ${LIBREDESK_BUILD:-production}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-libredesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:-libredesk}
+      LIBREDESK_ENCRYPTION_KEY: ${LIBREDESK_ENCRYPTION_KEY:?Set LIBREDESK_ENCRYPTION_KEY in .env.production}
+      LIBREDESK_SYSTEM_USER_PASSWORD: ${LIBREDESK_SYSTEM_USER_PASSWORD:-}
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${LIBREDESK_HOST_PORT:-9001}:9000"
+    networks:
+      libredesk:
+      liora-platform:
+        aliases:
+          - libredesk-app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads-data:/libredesk/uploads
+      - ./config.production.toml.template:/libredesk/config.production.toml.template:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        envsubst < /libredesk/config.production.toml.template > /tmp/config.toml
+        ./libredesk --install --idempotent-install --yes --config /tmp/config.toml
+        ./libredesk --upgrade --yes --config /tmp/config.toml
+        exec ./libredesk --config /tmp/config.toml
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-libredesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:-libredesk}
+    networks:
+      - libredesk
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-libredesk} -d ${POSTGRES_DB:-libredesk}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    networks:
+      - libredesk
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - redis-data:/data
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  zalo-connector:
+    image: ${ZALO_CONNECTOR_IMAGE:-libredesk-zalo-connector:prod}
+    build:
+      context: ./services/zalo-connector
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3100
+      DATA_DIR: /app/data
+      ZALO_ACCOUNT_ID: ${ZALO_ACCOUNT_ID:-demo-zalo}
+      CONNECTOR_TOKEN: ${ZALO_CONNECTOR_TOKEN:?Set ZALO_CONNECTOR_TOKEN in .env.production}
+      CUSTOMER_CARE_WEBHOOK_URL: ${CUSTOMER_CARE_WEBHOOK_URL:?Set CUSTOMER_CARE_WEBHOOK_URL in .env.production}
+      CUSTOMER_CARE_WEBHOOK_SECRET: ${CUSTOMER_CARE_WEBHOOK_SECRET:?Set CUSTOMER_CARE_WEBHOOK_SECRET in .env.production}
+      CUSTOMER_CARE_TENANT_ID: ${CUSTOMER_CARE_TENANT_ID:-1}
+      INBOUND_RETRY_COUNT: ${INBOUND_RETRY_COUNT:-5}
+      INBOUND_RETRY_BASE_MS: ${INBOUND_RETRY_BASE_MS:-1000}
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${ZALO_HOST_PORT:-3100}:3100"
+    networks:
+      libredesk:
+      liora-platform:
+        aliases:
+          - zalo-connector
+    volumes:
+      - zalo-data:/app/data
+    depends_on:
+      app:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  facebook-connector:
+    image: ${FACEBOOK_CONNECTOR_IMAGE:-libredesk-facebook-connector:prod}
+
+    build:
+      context: .
+      dockerfile: services/facebook-connector/Dockerfile.production
+      args:
+        DEPLAO_REF: ${DEPLAO_REF:-v26.8.2}
+        MAUTRIX_META_REF: ${MAUTRIX_META_REF:-f3bfc5474e2a3bc772ace1cddf591bb9cf60a318}
+
+    restart: unless-stopped
+    init: true
+
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3200
+      DATA_DIR: /app/data
+
+      FACEBOOK_ACCOUNT_ID: ${FACEBOOK_ACCOUNT_ID:-demo-facebook}
+      CONNECTOR_TOKEN: ${FACEBOOK_CONNECTOR_TOKEN:?Set FACEBOOK_CONNECTOR_TOKEN in .env.production}
+
+      CUSTOMER_CARE_WEBHOOK_URL: ${CUSTOMER_CARE_FACEBOOK_WEBHOOK_URL:?Set CUSTOMER_CARE_FACEBOOK_WEBHOOK_URL in .env.production}
+      CUSTOMER_CARE_WEBHOOK_SECRET: ${CUSTOMER_CARE_WEBHOOK_SECRET:?Set CUSTOMER_CARE_WEBHOOK_SECRET in .env.production}
+
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${FACEBOOK_HOST_PORT:-3200}:3200"
+
+    networks:
+      libredesk:
+      liora-platform:
+        aliases:
+          - facebook-connector
+
+    volumes:
+      - facebook-data:/app/data
+
+    depends_on:
+      app:
+        condition: service_started
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3200/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  libredesk:
+    internal: true
+
+  liora-platform:
+    external: true
+    name: ${LIORA_PLATFORM_NETWORK:-liora-platform}
+
+volumes:
+  postgres-data:
+  redis-data:
+  uploads-data:
+  zalo-data:
+  facebook-data:

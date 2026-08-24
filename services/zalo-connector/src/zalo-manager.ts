@@ -1,17 +1,15 @@
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  LoginQRCallbackEventType,
-  ThreadType,
-  Zalo,
-} from "zca-js";
+import { LoginQRCallbackEventType, ThreadType, Zalo } from "zca-js";
 import type { API, Credentials, Message } from "zca-js";
 import {
   pushDeliveryStatusToCustomerCare,
   pushInboundToCustomerCare,
+  pushPresenceToCustomerCare,
   type CustomerCareConnectorEvent,
   type NormalizedDeliveryStatus,
+  type NormalizedPresenceStatus,
   type NormalizedZaloInbound,
 } from "./customer-care.js";
 import {
@@ -51,7 +49,11 @@ export interface ConnectorStatus {
   qr_available: boolean;
 }
 
-type CachedProfile = { displayName: string; avatarUrl: string; expiresAt: number };
+type CachedProfile = {
+  displayName: string;
+  avatarUrl: string;
+  expiresAt: number;
+};
 type OutboundAttachment = { name: string; mimeType: string; data: Buffer };
 export interface ZaloManagerOptions {
   connectionKey: string;
@@ -76,8 +78,14 @@ export class ZaloManager {
   private reconnectAttempts = 0;
   private outboxRetryTimer?: NodeJS.Timeout;
   private readonly profileCache = new Map<string, CachedProfile>();
+  private readonly presencePeers = new Set<string>();
+  private readonly presenceSignatures = new Map<string, string>();
+  private presenceTimer?: NodeJS.Timeout;
   private readonly outboundReceipts = new Map<string, OutboundReceipt>();
-  private readonly outboundInFlight = new Map<string, Promise<{ externalMessageId?: string }>>();
+  private readonly outboundInFlight = new Map<
+    string,
+    Promise<{ externalMessageId?: string }>
+  >();
   private readonly inboundOutbox = new Map<string, PendingInboundRecord>();
   private readonly recentInboundEvents = new Set<string>();
   private outboundPersistQueue: Promise<void> = Promise.resolve();
@@ -178,7 +186,8 @@ export class ZaloManager {
       throw new Error("Zalo account is not connected");
     }
 
-    const threadType = input.threadType === "group" ? ThreadType.Group : ThreadType.User;
+    const threadType =
+      input.threadType === "group" ? ThreadType.Group : ThreadType.User;
     const attachments = input.attachments?.map((attachment) => ({
       data: attachment.data,
       filename: ensureFileExtension(attachment.name, attachment.mimeType),
@@ -231,6 +240,10 @@ export class ZaloManager {
     await clearCredentials(this.options.dataDir);
     this.profile = undefined;
     this.profileCache.clear();
+    await this.markTrackedPresenceUnknown();
+    this.presencePeers.clear();
+    this.presenceSignatures.clear();
+    this.stopPresencePolling();
     this.phase = "disconnected";
     this.lastError = undefined;
     await fs.rm(this.qrPath, { force: true });
@@ -252,70 +265,103 @@ export class ZaloManager {
       if (credentials) {
         api = await zalo.login(credentials);
       } else {
-        api = await zalo.loginQR(
-          { qrPath: this.qrPath },
-          (event) => {
-            switch (event.type) {
-              case LoginQRCallbackEventType.QRCodeGenerated:
-                void event.actions.saveToFile(this.qrPath)
-                  .then(() => {
-                    this.phase = "qr_ready";
-                    this.lastError = undefined;
-                    console.log(`[zalo] QR saved at ${this.qrPath}`);
-                  })
-                  .catch((error: unknown) => {
-                    this.phase = "error";
-                    this.lastError = error instanceof Error ? error.message : String(error);
-                    console.error("[zalo] failed to save QR:", error);
-                  });
-                break;
-              case LoginQRCallbackEventType.QRCodeScanned:
-                this.phase = "connecting";
-                console.log(`[zalo] QR scanned by ${event.data.display_name}`);
-                void fs.rm(this.qrPath, { force: true });
-                break;
-              case LoginQRCallbackEventType.QRCodeExpired:
-              case LoginQRCallbackEventType.QRCodeDeclined:
-                this.phase = "connecting";
-                // zca-js may reject retry() when QR polling already expired.
-                // Consume that rejection so it cannot restart the connector.
-                void fs
-                  .rm(this.qrPath, { force: true })
-                  .then(() => event.actions.retry())
-                  .catch((error: unknown) => {
-                    this.lastError = error instanceof Error ? error.message : String(error);
-                    console.warn("[zalo] QR retry failed:", error);
-                  });
-                break;
-              case LoginQRCallbackEventType.GotLoginInfo:
-                this.phase = "connecting";
-                break;
-            }
-          },
-        );
+        api = await zalo.loginQR({ qrPath: this.qrPath }, (event) => {
+          switch (event.type) {
+            case LoginQRCallbackEventType.QRCodeGenerated:
+              void event.actions
+                .saveToFile(this.qrPath)
+                .then(() => {
+                  this.phase = "qr_ready";
+                  this.lastError = undefined;
+                  console.log(`[zalo] QR saved at ${this.qrPath}`);
+                })
+                .catch((error: unknown) => {
+                  this.phase = "error";
+                  this.lastError =
+                    error instanceof Error ? error.message : String(error);
+                  console.error("[zalo] failed to save QR:", error);
+                });
+              break;
+            case LoginQRCallbackEventType.QRCodeScanned:
+              this.phase = "connecting";
+              console.log(`[zalo] QR scanned by ${event.data.display_name}`);
+              void fs.rm(this.qrPath, { force: true });
+              break;
+            case LoginQRCallbackEventType.QRCodeExpired:
+            case LoginQRCallbackEventType.QRCodeDeclined:
+              this.phase = "connecting";
+              // zca-js may reject retry() when QR polling already expired.
+              // Consume that rejection so it cannot restart the connector.
+              void fs
+                .rm(this.qrPath, { force: true })
+                .then(() => event.actions.retry())
+                .catch((error: unknown) => {
+                  this.lastError =
+                    error instanceof Error ? error.message : String(error);
+                  console.warn("[zalo] QR retry failed:", error);
+                });
+              break;
+            case LoginQRCallbackEventType.GotLoginInfo:
+              this.phase = "connecting";
+              break;
+          }
+        });
         await this.persistCredentials(api);
         await fs.rm(this.qrPath, { force: true });
       }
 
       this.api = api;
       this.registerListener(api);
-      this.profile = await api.fetchAccountInfo().catch((error: unknown) => ({
-        warning: error instanceof Error ? error.message : String(error),
-      }));
-      const profileRecord = this.profile && typeof this.profile === "object"
-        ? this.profile as Record<string, unknown>
-        : {};
-      const accountProfile = profileRecord.profile && typeof profileRecord.profile === "object"
-        ? profileRecord.profile as Record<string, unknown>
-        : profileRecord;
-      // fetchAccountInfo() returns { profile: User }, whose identity is userId.
-      // Reading root uid/id left connected accounts marked as pending.
+
+      // fetchAccountInfo() returns { profile: User }. Normalize the logged-in
+      // account profile at the connector boundary so every consumer gets one
+      // stable shape. In particular, zca-js exposes the account image as
+      // profile.avatar while the CSKH frontend consumes profile.avatarUrl.
+      const fetchedProfile = await api
+        .fetchAccountInfo()
+        .catch((error: unknown) => ({
+          warning: error instanceof Error ? error.message : String(error),
+        }));
+      const profileRecord =
+        fetchedProfile && typeof fetchedProfile === "object"
+          ? (fetchedProfile as Record<string, unknown>)
+          : {};
+      const accountProfile =
+        profileRecord.profile && typeof profileRecord.profile === "object"
+          ? (profileRecord.profile as Record<string, unknown>)
+          : profileRecord;
+
+      // fetchAccountInfo() identifies the logged-in account with userId.
       this.accountId =
         stringValue(accountProfile.userId) ||
         stringValue(accountProfile.uid) ||
         stringValue(accountProfile.id) ||
         stringValue(accountProfile.globalId) ||
         this.accountId;
+
+      const accountAvatar =
+        stringValue(accountProfile.avatar) ||
+        stringValue(accountProfile.avatarUrl) ||
+        stringValue(accountProfile.avatar_url);
+      const accountDisplayName =
+        stringValue(accountProfile.displayName) ||
+        stringValue(accountProfile.zaloName) ||
+        stringValue(accountProfile.username);
+
+      this.profile = {
+        ...accountProfile,
+        userId: this.accountId,
+        ...(accountDisplayName ? { displayName: accountDisplayName } : {}),
+        ...(accountAvatar
+          ? { avatar: accountAvatar, avatarUrl: accountAvatar }
+          : {}),
+      };
+
+      console.log("[zalo][trace] account.profile", {
+        accountId: this.accountId,
+        displayName: accountDisplayName || undefined,
+        hasAvatar: Boolean(accountAvatar),
+      });
 
       api.listener.start({ retryOnClose: true });
     } catch (error) {
@@ -367,6 +413,7 @@ export class ZaloManager {
       void this.persistCheckpoint();
       void fs.rm(this.qrPath, { force: true });
       void this.drainInboundOutbox();
+      this.startPresencePolling();
       console.log("[zalo][trace] listener.connected", {
         accountId: this.accountId,
         pendingEvents: this.inboundOutbox.size,
@@ -379,6 +426,8 @@ export class ZaloManager {
       this.lastError = `socket disconnected (${code})${reason ? `: ${reason}` : ""}`;
       this.checkpoint.lastDisconnectedAt = this.lastDisconnectedAt;
       void this.persistCheckpoint();
+      this.stopPresencePolling();
+      void this.markTrackedPresenceUnknown();
       console.warn("[zalo][trace] listener.disconnected", { code, reason });
     });
 
@@ -389,6 +438,8 @@ export class ZaloManager {
       this.lastError = `socket closed (${code})${reason ? `: ${reason}` : ""}`;
       this.checkpoint.lastDisconnectedAt = this.lastDisconnectedAt;
       void this.persistCheckpoint();
+      this.stopPresencePolling();
+      void this.markTrackedPresenceUnknown();
       if (this.reconnectEnabled) {
         console.warn("[zalo][trace] listener.closed", { code, reason });
         this.scheduleReconnect();
@@ -445,6 +496,10 @@ export class ZaloManager {
           ? externalThreadId
           : String(event.data.uidFrom || externalThreadId)
         : String(event.data.uidFrom || externalThreadId);
+
+    if (threadType === "user") {
+      this.trackPresencePeer(peerExternalId);
+    }
 
     const eventDisplayName =
       typeof event.data.dName === "string" ? event.data.dName.trim() : "";
@@ -508,16 +563,27 @@ export class ZaloManager {
   ): Promise<void> {
     if (!receipt || typeof receipt !== "object") return;
     const record = receipt as Record<string, unknown>;
-    const data = record.data && typeof record.data === "object"
-      ? record.data as Record<string, unknown>
-      : {};
-    const threadId = stringValue(record.threadId) || stringValue(data.groupId) || stringValue(data.idTo);
+    const data =
+      record.data && typeof record.data === "object"
+        ? (record.data as Record<string, unknown>)
+        : {};
+    const threadId =
+      stringValue(record.threadId) ||
+      stringValue(data.groupId) ||
+      stringValue(data.idTo);
     if (!threadId) return;
+    if (!stringValue(data.groupId)) this.trackPresencePeer(threadId);
 
     // Zalo receipts may expose both msgId and realMsgId. Keep both because the
     // send ACK and listener echo can use different native IDs depending on chat type.
-    const rawIds = [...new Set([stringValue(data.realMsgId), stringValue(data.msgId)].filter(Boolean))];
-    if (!rawIds.length) return;
+    const rawIds = [
+      ...new Set(
+        [stringValue(data.realMsgId), stringValue(data.msgId)].filter(Boolean),
+      ),
+    ];
+
+    const primaryRawId = rawIds[0];
+    if (!primaryRawId) return;
     const externalIds = rawIds.map((id) => `${this.accountId}:${id}`);
     const connectorOutbound = rawIds
       .map((id) => this.findConnectorOutbound(id))
@@ -539,12 +605,17 @@ export class ZaloManager {
     };
 
     console.log("[zalo][trace] delivery.detected", {
-      eventId: payload.event_id, status, threadId, externalMessageIds: externalIds,
+      eventId: payload.event_id,
+      status,
+      threadId,
+      externalMessageIds: externalIds,
     });
-    await this.enqueueInbound(payload, rawIds[0], threadId);
+    await this.enqueueInbound(payload, primaryRawId, threadId);
   }
 
-  private findConnectorOutbound(rawMessageId: string): OutboundReceipt | undefined {
+  private findConnectorOutbound(
+    rawMessageId: string,
+  ): OutboundReceipt | undefined {
     const needle = String(rawMessageId).trim();
     if (!needle) return undefined;
 
@@ -562,7 +633,9 @@ export class ZaloManager {
     threadId: string,
   ): Promise<void> {
     if (this.recentInboundEvents.has(payload.event_id)) {
-      console.log("[zalo][trace] event.duplicate.skip", { eventId: payload.event_id });
+      console.log("[zalo][trace] event.duplicate.skip", {
+        eventId: payload.event_id,
+      });
       return;
     }
 
@@ -575,9 +648,14 @@ export class ZaloManager {
     }
 
     this.checkpoint.lastEventId = payload.event_id;
-    this.checkpoint.lastMessageId = rawMessageId;
-    this.checkpoint.lastThreadId = threadId;
-    this.checkpoint.lastEventAt = payload.occurred_at;
+    if (!("event_type" in payload && payload.event_type === "presence")) {
+      this.checkpoint.lastMessageId = rawMessageId;
+      this.checkpoint.lastThreadId = threadId;
+    }
+    this.checkpoint.lastEventAt =
+      "event_type" in payload && payload.event_type === "presence"
+        ? payload.observed_at
+        : payload.occurred_at;
     await Promise.all([this.persistInboundOutbox(), this.persistCheckpoint()]);
     void this.drainInboundOutbox();
   }
@@ -599,7 +677,9 @@ export class ZaloManager {
   private persistCheckpoint(): Promise<void> {
     this.checkpointPersistQueue = this.checkpointPersistQueue
       .catch(() => undefined)
-      .then(() => saveRealtimeCheckpoint(this.options.dataDir, this.checkpoint));
+      .then(() =>
+        saveRealtimeCheckpoint(this.options.dataDir, this.checkpoint),
+      );
     return this.checkpointPersistQueue;
   }
 
@@ -630,18 +710,29 @@ export class ZaloManager {
               retryCount: this.options.retryCount,
               retryBaseMs: this.options.retryBaseMs,
             };
-            const result = "event_type" in payload && payload.event_type === "delivery_status"
-              ? await pushDeliveryStatusToCustomerCare(payload, context)
-              : await pushInboundToCustomerCare(payload, context);
+            const result =
+              "event_type" in payload &&
+              payload.event_type === "delivery_status"
+                ? await pushDeliveryStatusToCustomerCare(payload, context)
+                : "event_type" in payload && payload.event_type === "presence"
+                  ? await pushPresenceToCustomerCare(payload, context)
+                  : await pushInboundToCustomerCare(payload, context);
             this.inboundOutbox.delete(record.eventId);
             this.rememberProcessedEvent(record.eventId);
-            await Promise.all([this.persistInboundOutbox(), this.persistCheckpoint()]);
+            await Promise.all([
+              this.persistInboundOutbox(),
+              this.persistCheckpoint(),
+            ]);
             console.log("[zalo][trace] webhook.ok", {
               eventId: payload.event_id,
               conversationUuid: result.conversation_uuid,
-              ...("message_uuid" in result ? { messageUuid: result.message_uuid } : {}),
+              ...("message_uuid" in result
+                ? { messageUuid: result.message_uuid }
+                : {}),
               ...("duplicate" in result ? { duplicate: result.duplicate } : {}),
-              ...("updated" in result ? { updated: result.updated, ignored: result.ignored } : {}),
+              ...("updated" in result
+                ? { updated: result.updated, ignored: result.ignored }
+                : {}),
               pendingEvents: this.inboundOutbox.size,
             });
           } catch (error) {
@@ -683,19 +774,170 @@ export class ZaloManager {
     this.outboxRetryTimer.unref();
   }
 
-  private async getUserProfile(userId: string): Promise<{ displayName: string; avatarUrl: string }> {
+  private trackPresencePeer(userId: string): void {
+    const id = userId.trim();
+    if (!id || id === this.accountId) return;
+    this.presencePeers.add(id);
+    if (this.isConnected()) {
+      void this.refreshZaloPresence([id]).catch((error) => {
+        console.warn(`[zalo] presence refresh failed for ${id}:`, error);
+      });
+    }
+  }
+
+  private startPresencePolling(): void {
+    this.stopPresencePolling();
+    void this.refreshZaloPresence().catch((error) => {
+      console.warn("[zalo] initial presence refresh failed:", error);
+    });
+    this.presenceTimer = setInterval(() => {
+      void this.refreshZaloPresence().catch((error) => {
+        console.warn("[zalo] presence refresh failed:", error);
+      });
+    }, 60_000);
+    this.presenceTimer.unref();
+  }
+
+  private stopPresencePolling(): void {
+    if (this.presenceTimer) clearInterval(this.presenceTimer);
+    this.presenceTimer = undefined;
+  }
+
+  private async markTrackedPresenceUnknown(): Promise<void> {
+    if (!this.presencePeers.size) return;
+    const observedAt = new Date().toISOString();
+    for (const userId of this.presencePeers) {
+      const signature = "unknown:";
+      if (this.presenceSignatures.get(userId) === signature) continue;
+      this.presenceSignatures.set(userId, signature);
+      const payload: NormalizedPresenceStatus = {
+        event_id: `${this.accountId}:presence:${userId}:unknown:${observedAt}`,
+        event_type: "presence",
+        provider: "zalo_personal",
+        account_id: this.accountId,
+        external_thread_id: userId,
+        external_user_id: userId,
+        state: "unknown",
+        observed_at: observedAt,
+        source: "native",
+      };
+      await this.enqueueInbound(payload, `presence:${userId}`, userId);
+    }
+  }
+
+  private async refreshZaloPresence(explicitIds?: string[]): Promise<void> {
+    if (!this.api || !this.isConnected()) return;
+    const ids = [
+      ...new Set(
+        (explicitIds ?? [...this.presencePeers])
+          .map((value) => value.trim())
+          .filter(Boolean),
+      ),
+    ];
+    if (!ids.length) return;
+
+    for (let offset = 0; offset < ids.length; offset += 20) {
+      const batch = ids.slice(offset, offset + 20);
+      const response = (await this.api.getUserInfo(batch)) as unknown as Record<
+        string,
+        unknown
+      >;
+      const changed =
+        response.changed_profiles &&
+        typeof response.changed_profiles === "object"
+          ? (response.changed_profiles as Record<
+              string,
+              Record<string, unknown>
+            >)
+          : {};
+
+      for (const userId of batch) {
+        const profile =
+          changed[userId] ||
+          changed[`${userId}_0`] ||
+          Object.values(changed).find(
+            (value) => stringValue(value.userId) === userId,
+          );
+        if (!profile) continue;
+        await this.publishZaloPresence(userId, profile);
+      }
+    }
+  }
+
+  private async publishZaloPresence(
+    userId: string,
+    profile: Record<string, unknown>,
+  ): Promise<void> {
+    const flags = [profile.isActive, profile.isActivePC, profile.isActiveWeb]
+      .map(numberValue)
+      .filter((value): value is number => value !== undefined);
+    const lastActionRaw = numberValue(profile.lastActionTime);
+    if (!flags.length && lastActionRaw == null) return;
+
+    const observedAt = new Date().toISOString();
+    const online = flags.some((value) => value === 1);
+    const lastActiveAt =
+      lastActionRaw && lastActionRaw > 0
+        ? providerTimestampToISO(lastActionRaw)
+        : online
+          ? observedAt
+          : undefined;
+    const state: NormalizedPresenceStatus["state"] = online
+      ? "online"
+      : "offline";
+    const signature = `${state}:${lastActiveAt || ""}`;
+    if (this.presenceSignatures.get(userId) === signature) return;
+    this.presenceSignatures.set(userId, signature);
+
+    const payload: NormalizedPresenceStatus = {
+      event_id: `${this.accountId}:presence:${userId}:${state}:${lastActiveAt || "unknown"}`,
+      event_type: "presence",
+      provider: "zalo_personal",
+      account_id: this.accountId,
+      external_thread_id: userId,
+      external_user_id: userId,
+      state,
+      ...(lastActiveAt ? { last_active_at: lastActiveAt } : {}),
+      observed_at: observedAt,
+      source: "native",
+    };
+    console.log("[zalo][trace] presence.detected", {
+      eventId: payload.event_id,
+      userId,
+      state,
+      lastActiveAt,
+    });
+    await this.enqueueInbound(payload, `presence:${userId}`, userId);
+  }
+
+  private async getUserProfile(
+    userId: string,
+  ): Promise<{ displayName: string; avatarUrl: string }> {
     const cached = this.profileCache.get(userId);
     if (cached && cached.expiresAt > Date.now()) return cached;
     const fallback = { displayName: "", avatarUrl: "" };
     if (!this.api) return fallback;
     try {
-      const response = await this.api.getUserInfo(userId) as unknown as Record<string, unknown>;
-      const changedProfiles = response.changed_profiles && typeof response.changed_profiles === "object"
-        ? response.changed_profiles as Record<string, Record<string, unknown>>
-        : {};
-      const profile = changedProfiles[userId] || Object.values(changedProfiles)[0] || response;
+      const response = (await this.api.getUserInfo(
+        userId,
+      )) as unknown as Record<string, unknown>;
+      const changedProfiles =
+        response.changed_profiles &&
+        typeof response.changed_profiles === "object"
+          ? (response.changed_profiles as Record<
+              string,
+              Record<string, unknown>
+            >)
+          : {};
+      const profile =
+        changedProfiles[userId] ||
+        Object.values(changedProfiles)[0] ||
+        response;
       const value = {
-        displayName: stringValue(profile.displayName) || stringValue(profile.zaloName) || "",
+        displayName:
+          stringValue(profile.displayName) ||
+          stringValue(profile.zaloName) ||
+          "",
         avatarUrl: stringValue(profile.avatar) || "",
         expiresAt: Date.now() + 30 * 60_000,
       };
@@ -722,7 +964,10 @@ export class ZaloManager {
     let resolvedDelay = delayMs;
     if (resolvedDelay == null) {
       this.reconnectAttempts += 1;
-      const base = Math.min(60_000, 1_000 * 2 ** Math.min(this.reconnectAttempts - 1, 6));
+      const base = Math.min(
+        60_000,
+        1_000 * 2 ** Math.min(this.reconnectAttempts - 1, 6),
+      );
       const jitter = Math.floor(base * Math.random() * 0.25);
       resolvedDelay = Math.min(60_000, base + jitter);
     }
@@ -742,6 +987,23 @@ function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function providerTimestampToISO(value: number): string {
+  const milliseconds = value < 10_000_000_000 ? value * 1000 : value;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime())
+    ? new Date().toISOString()
+    : date.toISOString();
+}
+
 function extractMessageId(value: unknown): string | undefined {
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -756,9 +1018,16 @@ function extractMessageId(value: unknown): string | undefined {
   return id == null ? undefined : String(id);
 }
 
-function ensureFileExtension(name: string, mimeType: string): `${string}.${string}` {
+function ensureFileExtension(
+  name: string,
+  mimeType: string,
+): `${string}.${string}` {
   if (/\.[a-z0-9]{1,10}$/i.test(name)) return name as `${string}.${string}`;
-  const extension = mimeType.split("/")[1]?.split(/[;+]/)[0]?.replace(/[^a-z0-9]/gi, "") || "bin";
+  const extension =
+    mimeType
+      .split("/")[1]
+      ?.split(/[;+]/)[0]
+      ?.replace(/[^a-z0-9]/gi, "") || "bin";
   return `${name}.${extension}`;
 }
 
@@ -780,7 +1049,11 @@ function normalizeOccurredAt(value: unknown): string {
 function toJSONSafe(value: unknown): unknown {
   if (value === undefined) return undefined;
   try {
-    return JSON.parse(JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item)) as unknown;
+    return JSON.parse(
+      JSON.stringify(value, (_key, item) =>
+        typeof item === "bigint" ? item.toString() : item,
+      ),
+    ) as unknown;
   } catch {
     return { warning: "profile could not be serialized" };
   }
