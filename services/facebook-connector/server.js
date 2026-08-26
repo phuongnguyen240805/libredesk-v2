@@ -130,7 +130,7 @@ async function stopBridge(intentional = true) {
   const child = bridge;
   if (!child) return;
   if (intentional) intentionalStops.add(child);
-  try { await rpc("disconnect", {}, 5_000); } catch {}
+  try { await rpc("disconnect", {}, 5_000); } catch { }
   child.kill("SIGTERM");
   if (bridge === child) bridge = undefined;
   rejectPending(new Error("Facebook bridge stopped"));
@@ -464,32 +464,115 @@ async function getFacebookContact(userId) {
 }
 
 async function pushWebhook(payload) {
-  const body = JSON.stringify(payload);
+  const eventType = payload.event_type;
+
+  const targetURL =
+    eventType === "delivery_status"
+      ? config.webhookURL.replace(/\/events\/?$/, "/delivery")
+      : eventType === "presence"
+        ? config.webhookURL.replace(/\/events\/?$/, "/presence")
+        : config.webhookURL;
+
+  const webhookPayload = {
+    ...payload,
+  };
+
+  delete webhookPayload.event_type;
+
+  const body = JSON.stringify(webhookPayload);
+
   let error;
+
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       const timestamp = String(Date.now());
-      const signature = createHmac("sha256", config.channelSecret).update(`${timestamp}.${body}`).digest("hex");
-      const targetURL = payload.event_type === "delivery_status"
-        ? config.webhookURL.replace(/\/events\/?$/, "/delivery")
-        : payload.event_type === "presence"
-          ? config.webhookURL.replace(/\/events\/?$/, "/presence")
-          : config.webhookURL;
+
+      const signature = createHmac(
+        "sha256",
+        config.channelSecret,
+      )
+        .update(`${timestamp}.${body}`)
+        .digest("hex");
+
       const response = await fetch(targetURL, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-customer-care-timestamp": timestamp, "x-customer-care-signature": signature },
+
+        headers: {
+          "content-type": "application/json",
+          "x-customer-care-timestamp": timestamp,
+          "x-customer-care-signature": signature,
+        },
+
         body,
+
         signal: AbortSignal.timeout(20_000),
       });
-      if (!response.ok) throw new Error(`Customer Care returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+
+      if (!response.ok) {
+        const responseText = await response.text();
+
+        throw new Error(
+          `Customer Care returned HTTP ${response.status}: ${responseText.slice(
+            0,
+            300,
+          )}`,
+        );
+      }
+
       return;
     } catch (reason) {
-      error = reason;
-      await new Promise((resolve) => setTimeout(resolve, 1_000 * 2 ** attempt));
+      error =
+        reason instanceof Error
+          ? reason
+          : new Error(String(reason));
+
+      /*
+       * Retry:
+       *
+       * attempt 0 -> 1s
+       * attempt 1 -> 2s
+       * attempt 2 -> 4s
+       * attempt 3 -> 8s
+       * attempt 4 -> 16s
+       */
+      if (attempt < 4) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 1_000 * 2 ** attempt),
+        );
+      }
     }
   }
+
   throw error;
 }
+
+// async function pushWebhook(payload) {
+//   const body = JSON.stringify(payload);
+//   let error;
+//   for (let attempt = 0; attempt < 5; attempt += 1) {
+//     try {
+//       const timestamp = String(Date.now());
+//       const signature = createHmac("sha256", config.channelSecret).update(`${timestamp}.${body}`).digest("hex");
+//       const targetURL = payload.event_type === "delivery_status"
+//         ? config.webhookURL.replace(/\/events\/?$/, "/delivery")
+//         : payload.event_type === "presence"
+//           ? config.webhookURL.replace(/\/events\/?$/, "/presence")
+//           : config.webhookURL;
+//       const response = await fetch(targetURL, {
+//         method: "POST",
+//         headers: { "content-type": "application/json", "x-customer-care-timestamp": timestamp, "x-customer-care-signature": signature },
+//         body,
+//         signal: AbortSignal.timeout(20_000),
+//       });
+//       if (!response.ok) throw new Error(`Customer Care returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+//       return;
+//     } catch (reason) {
+//       error = reason;
+//       await new Promise((resolve) => setTimeout(resolve, 1_000 * 2 ** attempt));
+//     }
+//   }
+//   throw error;
+// }
 
 async function enqueueInbound(payload, rawMessageId, threadId) {
   if (recentInboundEvents.has(payload.event_id)) {
@@ -501,6 +584,7 @@ async function enqueueInbound(payload, rawMessageId, threadId) {
       eventId: payload.event_id,
       payload,
       queuedAt: new Date().toISOString(),
+      attemptCount: 0,
     });
   }
   checkpoint.lastEventId = payload.event_id;
@@ -557,11 +641,20 @@ function drainInboundOutbox() {
         outboxRetryTimer = undefined;
       }
       const records = [...inboundOutbox.values()].sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
+      let failuresThisPass = 0;
+
       for (const record of records) {
+        // Do not let one stale/permanently-invalid native event hold the entire
+        // Facebook conversation stream hostage. Missing retry metadata on old
+        // outbox records intentionally means "eligible now".
+        const retryAt = record.nextAttemptAt ? Date.parse(record.nextAttemptAt) : Number.NaN;
+        if (Number.isFinite(retryAt) && retryAt > Date.now()) continue;
+
         const payload = record.payload;
         console.log("[facebook][trace] webhook.start", {
           eventId: payload.event_id,
           pendingEvents: inboundOutbox.size,
+          attemptCount: record.attemptCount ?? 0,
         });
         try {
           await pushWebhook(payload);
@@ -573,16 +666,37 @@ function drainInboundOutbox() {
             pendingEvents: inboundOutbox.size,
           });
         } catch (error) {
-          lastError = `webhook delivery failed: ${error instanceof Error ? error.message : String(error)}`;
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const attemptCount = (record.attemptCount ?? 0) + 1;
+          const retryDelayMs = Math.min(
+            5 * 60_000,
+            15_000 * 2 ** Math.min(attemptCount - 1, 4),
+          );
+          const nextAttemptAt = new Date(Date.now() + retryDelayMs).toISOString();
+
+          inboundOutbox.set(record.eventId, {
+            ...record,
+            attemptCount,
+            nextAttemptAt,
+            lastError: errorMessage,
+          });
+          await persistInboundOutbox();
+
+          lastError = `webhook delivery failed: ${errorMessage}`;
           console.error("[facebook][trace] webhook.pending", {
             eventId: payload.event_id,
             pendingEvents: inboundOutbox.size,
-            error: error instanceof Error ? error.message : String(error),
+            attemptCount,
+            nextAttemptAt,
+            error: errorMessage,
           });
-          scheduleOutboxRetry();
-          break;
+
+          failuresThisPass += 1;
+          if (failuresThisPass >= 2) break;
         }
       }
+
+      scheduleOutboxRetry();
     });
   return inboundDeliveryQueue;
 }
@@ -597,10 +711,25 @@ function rememberProcessedEvent(eventId) {
 
 function scheduleOutboxRetry() {
   if (outboxRetryTimer || !inboundOutbox.size) return;
+
+  const now = Date.now();
+  let earliestEligibleAt = Number.POSITIVE_INFINITY;
+  for (const record of inboundOutbox.values()) {
+    const retryAt = record.nextAttemptAt ? Date.parse(record.nextAttemptAt) : Number.NaN;
+    if (!Number.isFinite(retryAt)) {
+      earliestEligibleAt = now;
+      break;
+    }
+    earliestEligibleAt = Math.min(earliestEligibleAt, retryAt);
+  }
+  const delayMs = Number.isFinite(earliestEligibleAt)
+    ? Math.max(250, Math.min(5 * 60_000, earliestEligibleAt - now))
+    : 15_000;
+
   outboxRetryTimer = setTimeout(() => {
     outboxRetryTimer = undefined;
     void drainInboundOutbox();
-  }, 15_000);
+  }, delayMs);
   outboxRetryTimer.unref();
 }
 
@@ -800,6 +929,11 @@ async function loadRealtimeState() {
         eventId: record.eventId,
         payload: record.payload,
         queuedAt: optionalString(record.queuedAt) || new Date().toISOString(),
+        attemptCount: Number.isInteger(record.attemptCount) && record.attemptCount >= 0
+          ? record.attemptCount
+          : 0,
+        nextAttemptAt: optionalString(record.nextAttemptAt),
+        lastError: optionalString(record.lastError),
       });
     }
   }

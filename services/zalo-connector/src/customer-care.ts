@@ -100,7 +100,12 @@ export async function pushDeliveryStatusToCustomerCare(
   payload: NormalizedDeliveryStatus,
   context: CustomerCareWebhookContext,
 ): Promise<CustomerCareDeliveryResult> {
-  const decoded = await postSigned(payload, context, "delivery", "zalo");
+  // event_type is connector-internal routing metadata. The Nest /delivery DTO
+  // intentionally does not expose this field and ValidationPipe rejects unknown
+  // properties with HTTP 422. Clone instead of mutating the durable outbox payload,
+  // then sign/send exactly the sanitized raw body.
+  const { event_type: _eventType, ...webhookPayload } = payload;
+  const decoded = await postSigned(webhookPayload, context, "delivery", "zalo");
   return unwrapDeliveryEnvelope(decoded);
 }
 

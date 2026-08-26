@@ -12,6 +12,12 @@ export interface PendingInboundRecord {
   eventId: string;
   payload: unknown;
   queuedAt: string;
+  /** Number of failed deliveries. Optional for backward compatibility with old outbox files. */
+  attemptCount?: number;
+  /** ISO timestamp after which this record is eligible for another delivery attempt. */
+  nextAttemptAt?: string;
+  /** Last delivery error, persisted only for diagnostics. */
+  lastError?: string;
 }
 
 export interface RealtimeCheckpoint {

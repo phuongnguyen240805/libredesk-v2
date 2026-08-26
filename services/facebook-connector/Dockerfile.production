@@ -1,88 +1,107 @@
-# ============================================================
-# Stage 1: Build LibreDesk frontend
-# ============================================================
-FROM node:22-alpine AS frontend-builder
+FROM golang:1.25-bookworm AS bridge-builder
 
-WORKDIR /src/frontend
+ARG DEPLAO_REF=v26.8.2
+ARG MAUTRIX_META_REF=f3bfc5474e2a3bc772ace1cddf591bb9cf60a318
 
-RUN corepack enable
-
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-
-RUN pnpm install --frozen-lockfile
-
-COPY frontend/ ./
-
-ARG LIBREDESK_VERSION=production
-ENV VITE_APP_VERSION=${LIBREDESK_VERSION}
-
-RUN pnpm build:main \
-    && pnpm build:widget
-
-
-# ============================================================
-# Stage 2: Build LibreDesk Go binary + embed static assets
-# ============================================================
-FROM golang:1.25-alpine AS backend-builder
+ENV GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /src
 
-RUN apk add --no-cache \
-    git \
-    ca-certificates
+RUN set -eux; \
+    mkdir -p /src/deplao; \
+    curl \
+      -fL \
+      --retry 8 \
+      --retry-all-errors \
+      --retry-delay 5 \
+      --connect-timeout 30 \
+      --max-time 300 \
+      "https://codeload.github.com/babyvibe/deplao-builder/tar.gz/refs/tags/${DEPLAO_REF}" \
+      -o /tmp/deplao.tar.gz; \
+    tar -xzf /tmp/deplao.tar.gz \
+      --strip-components=1 \
+      -C /src/deplao; \
+    rm -f /tmp/deplao.tar.gz
 
-COPY go.mod go.sum ./
+WORKDIR /src/deplao/src/bridge-e2ee
 
-RUN go mod download
+# ------------------------------------------------------------
+# go.mod uses local ./meta.
+#
+# Download mautrix/meta snapshot directly instead of git fetch.
+# ------------------------------------------------------------
+RUN set -eux; \
+    rm -rf ./meta; \
+    mkdir -p ./meta; \
+    curl \
+      -fL \
+      --retry 8 \
+      --retry-all-errors \
+      --retry-delay 5 \
+      --connect-timeout 30 \
+      --max-time 300 \
+      "https://codeload.github.com/mautrix/meta/tar.gz/${MAUTRIX_META_REF}" \
+      -o /tmp/meta.tar.gz; \
+    tar -xzf /tmp/meta.tar.gz \
+      --strip-components=1 \
+      -C ./meta; \
+    rm -f /tmp/meta.tar.gz
 
-COPY . .
+# ------------------------------------------------------------
+# Download Go dependencies with retry.
+# ------------------------------------------------------------
+RUN set -eux; \
+    attempt=1; \
+    while [ "$attempt" -le 5 ]; do \
+      if go mod download; then \
+        break; \
+      fi; \
+      if [ "$attempt" -eq 5 ]; then \
+        echo "go mod download failed after 5 attempts"; \
+        exit 1; \
+      fi; \
+      echo "go mod download failed - retry $attempt/5"; \
+      sleep $((attempt * 10)); \
+      attempt=$((attempt + 1)); \
+    done
 
-# Ghi đè frontend/dist bằng frontend vừa build ở stage trước
-COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
-
-# LibreDesk dùng stuffbin để nhúng:
-# frontend/dist, i18n, schema.sql, static
-RUN go install github.com/knadh/stuffbin/...
-
-ARG LIBREDESK_VERSION=production
-ARG LIBREDESK_BUILD=production
-
-RUN CGO_ENABLED=0 go build -a \
-    -ldflags="-s -w \
-    -X 'main.buildString=${LIBREDESK_BUILD}' \
-    -X 'main.versionString=${LIBREDESK_VERSION}' \
-    -X 'github.com/abhinavxd/libredesk/internal/version.Version=${LIBREDESK_VERSION}'" \
-    -o ./libredesk \
-    cmd/*.go
-
-# QUAN TRỌNG:
-# Nhúng schema + static + frontend vào binary
-RUN /go/bin/stuffbin \
-    -a stuff \
-    -in ./libredesk \
-    -out /out/libredesk \
-    frontend/dist \
-    i18n \
-    schema.sql \
-    static
-
+# ------------------------------------------------------------
+# Build Facebook E2EE bridge.
+# ------------------------------------------------------------
+RUN set -eux; \
+    mkdir -p /out; \
+    CGO_ENABLED=0 go build \
+      -trimpath \
+      -ldflags="-s -w" \
+      -o /out/fbchat-bridge-e2ee .
 
 # ============================================================
-# Stage 3: Production runtime
+# Runtime
 # ============================================================
-FROM alpine:3.21
 
-RUN apk add --no-cache \
-    ca-certificates \
-    tzdata \
-    gettext
+FROM node:22-alpine
 
-WORKDIR /libredesk
+WORKDIR /app
 
-COPY --from=backend-builder /out/libredesk ./libredesk
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=3200 \
+    DATA_DIR=/app/data \
+    FBCHAT_E2EE_BIN=/app/bin/fbchat-bridge-e2ee
 
-RUN mkdir -p /libredesk/uploads
+COPY services/facebook-connector/package.json ./package.json
+COPY services/facebook-connector/server.js ./server.js
+COPY services/facebook-connector/supervisor.js ./supervisor.js
 
-EXPOSE 9000
+COPY --from=bridge-builder \
+    /out/fbchat-bridge-e2ee \
+    /app/bin/fbchat-bridge-e2ee
 
-CMD ["./libredesk"]
+RUN mkdir -p /app/data /app/tmp \
+    && chown -R node:node /app
+
+USER node
+
+EXPOSE 3200
+
+CMD ["node", "supervisor.js"]

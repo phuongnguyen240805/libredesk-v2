@@ -695,11 +695,22 @@ export class ZaloManager {
         const records = [...this.inboundOutbox.values()].sort((a, b) =>
           a.queuedAt.localeCompare(b.queuedAt),
         );
+        let failuresThisPass = 0;
+
         for (const record of records) {
+          // A stale/permanently-invalid event must not block every newer native
+          // Zalo message behind it. Old outbox files do not have retry metadata,
+          // so missing nextAttemptAt intentionally means "eligible now".
+          const retryAt = record.nextAttemptAt
+            ? Date.parse(record.nextAttemptAt)
+            : Number.NaN;
+          if (Number.isFinite(retryAt) && retryAt > Date.now()) continue;
+
           const payload = record.payload as CustomerCareConnectorEvent;
           console.log("[zalo][trace] webhook.start", {
             eventId: payload.event_id,
             pendingEvents: this.inboundOutbox.size,
+            attemptCount: record.attemptCount ?? 0,
           });
           try {
             const context = {
@@ -736,18 +747,44 @@ export class ZaloManager {
               pendingEvents: this.inboundOutbox.size,
             });
           } catch (error) {
-            this.lastError = `webhook delivery failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`;
+            const errorMessage =
+              error instanceof Error ? error.message : String(error);
+            const attemptCount = (record.attemptCount ?? 0) + 1;
+            const retryDelayMs = Math.min(
+              5 * 60_000,
+              15_000 * 2 ** Math.min(attemptCount - 1, 4),
+            );
+            const nextAttemptAt = new Date(
+              Date.now() + retryDelayMs,
+            ).toISOString();
+
+            this.inboundOutbox.set(record.eventId, {
+              ...record,
+              attemptCount,
+              nextAttemptAt,
+              lastError: errorMessage,
+            });
+            await this.persistInboundOutbox();
+
+            this.lastError = `webhook delivery failed: ${errorMessage}`;
             console.error("[zalo][trace] webhook.pending", {
               eventId: payload.event_id,
               pendingEvents: this.inboundOutbox.size,
-              error: error instanceof Error ? error.message : String(error),
+              attemptCount,
+              nextAttemptAt,
+              error: errorMessage,
             });
-            this.scheduleOutboxRetry();
-            break;
+
+            // Give one newer record a chance. If two records fail in the same
+            // pass, assume the gateway/network is broadly unavailable and stop
+            // this pass to avoid hammering it. Untouched due records cause an
+            // immediate follow-up pass, while failed records keep backoff state.
+            failuresThisPass += 1;
+            if (failuresThisPass >= 2) break;
           }
         }
+
+        this.scheduleOutboxRetry();
       });
     return this.inboundDeliveryQueue;
   }
@@ -767,10 +804,28 @@ export class ZaloManager {
 
   private scheduleOutboxRetry(): void {
     if (this.outboxRetryTimer || !this.inboundOutbox.size) return;
+
+    const now = Date.now();
+    let earliestEligibleAt = Number.POSITIVE_INFINITY;
+    for (const record of this.inboundOutbox.values()) {
+      const retryAt = record.nextAttemptAt
+        ? Date.parse(record.nextAttemptAt)
+        : Number.NaN;
+      if (!Number.isFinite(retryAt)) {
+        earliestEligibleAt = now;
+        break;
+      }
+      earliestEligibleAt = Math.min(earliestEligibleAt, retryAt);
+    }
+
+    const delayMs = Number.isFinite(earliestEligibleAt)
+      ? Math.max(250, Math.min(5 * 60_000, earliestEligibleAt - now))
+      : 15_000;
+
     this.outboxRetryTimer = setTimeout(() => {
       this.outboxRetryTimer = undefined;
       void this.drainInboundOutbox();
-    }, 15_000);
+    }, delayMs);
     this.outboxRetryTimer.unref();
   }
 
