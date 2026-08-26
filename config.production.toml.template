@@ -69,14 +69,15 @@ expiry = "30m"
 # Postgres.
 [db]
 # If running locally, use `localhost`.
-host = "db"
+# host = "db"
 # Database port, default is 5432.
 port = 5432
 # Update the following values with your database credentials.
+host = "${POSTGRES_HOST}"
 user = "${POSTGRES_USER}"
 password = "${POSTGRES_PASSWORD}"
 database = "${POSTGRES_DB}"
-ssl_mode = "disable"
+ssl_mode = "require"
 # Maximum number of open database connections
 max_open = 30
 # Maximum number of idle connections in the pool

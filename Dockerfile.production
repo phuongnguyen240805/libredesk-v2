@@ -78,10 +78,10 @@ RUN chmod +x ./libredesk \
 EXPOSE 9000
 
 CMD ["/bin/sh", "-ec", "\
-  envsubst < /libredesk/config.production.toml.template > /tmp/config.toml && \
-  ./libredesk --install --idempotent-install --yes --config /tmp/config.toml && \
-  ./libredesk --upgrade --yes --config /tmp/config.toml && \
-  exec ./libredesk --config /tmp/config.toml \
+  envsubst < /libredesk/config.production.toml.template > /libredesk/config.toml && \
+  ./libredesk --install --idempotent-install --yes --config /libredesk/config.toml && \
+  ./libredesk --upgrade --yes --config /libredesk/config.toml && \
+  exec ./libredesk --config /libredesk/config.toml \
 "]
 
 # WORKDIR /libredesk
