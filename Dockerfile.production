@@ -70,10 +70,27 @@ RUN apk add --no-cache \
 WORKDIR /libredesk
 
 COPY --from=backend-builder /src/libredesk ./libredesk
+COPY config.production.toml.template ./config.production.toml.template
 
 RUN chmod +x ./libredesk \
     && mkdir -p /libredesk/uploads
 
 EXPOSE 9000
 
-CMD ["./libredesk", "--config", "/libredesk/config.toml"]
+CMD ["/bin/sh", "-ec", "\
+  envsubst < /libredesk/config.production.toml.template > /tmp/config.toml && \
+  ./libredesk --install --idempotent-install --yes --config /tmp/config.toml && \
+  ./libredesk --upgrade --yes --config /tmp/config.toml && \
+  exec ./libredesk --config /tmp/config.toml \
+"]
+
+# WORKDIR /libredesk
+
+# COPY --from=backend-builder /src/libredesk ./libredesk
+
+# RUN chmod +x ./libredesk \
+#     && mkdir -p /libredesk/uploads
+
+# EXPOSE 9000
+
+# CMD ["./libredesk", "--config", "/libredesk/config.toml"]
