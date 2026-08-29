@@ -23,9 +23,11 @@ func install(ctx context.Context, db *sqlx.DB, fs stuffbin.FileSystem, idempoten
 		log.Fatalf("error checking existing db schema: %v", err)
 	}
 
-	// Make sure the system user password is strong enough.
+	// Read the System user password from the environment. In production this
+	// value is also used to keep an existing System user in sync across
+	// idempotent deploys (for example, Render redeploys).
 	password := os.Getenv("LIBREDESK_SYSTEM_USER_PASSWORD")
-	if password != "" && !user.IsStrongPassword(password) && !schemaInstalled {
+	if password != "" && !user.IsStrongPassword(password) {
 		log.Fatalf("system user password is not strong, %s", user.PasswordHint)
 	}
 
@@ -45,8 +47,19 @@ func install(ctx context.Context, db *sqlx.DB, fs stuffbin.FileSystem, idempoten
 
 	if idempotentInstall {
 		if schemaInstalled {
+			// Previously this branch exited immediately, so changing
+			// LIBREDESK_SYSTEM_USER_PASSWORD after the first deployment had no
+			// effect. If a password is explicitly configured, synchronize it to
+			// the existing System user before finishing the idempotent install.
+			if password != "" {
+				if err := user.SetSystemUserPassword(ctx, password, db); err != nil {
+					log.Fatalf("error synchronizing system user password: %v", err)
+				}
+				log.Println("system user password synchronized from LIBREDESK_SYSTEM_USER_PASSWORD")
+			}
+
 			log.Println("skipping installation as schema is already installed")
-			os.Exit(0)
+			return nil
 		}
 	} else {
 		log.Println("installing database schema...")

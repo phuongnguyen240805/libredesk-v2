@@ -501,6 +501,32 @@ func (u *Manager) GetUserIDsByRole(roleID int) ([]int, error) {
 	return ids, nil
 }
 
+// SetSystemUserPassword updates the System user's password from a supplied
+// plaintext value. It is intended for non-interactive deployment flows where
+// LIBREDESK_SYSTEM_USER_PASSWORD is provided by the runtime environment.
+func SetSystemUserPassword(ctx context.Context, password string, db *sqlx.DB) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	if !IsStrongPassword(password) {
+		return fmt.Errorf("system user password is not strong, %s", PasswordHint)
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash system user password: %v", err)
+	}
+
+	if err := updateSystemUserPassword(db, hashedPassword); err != nil {
+		return fmt.Errorf("error updating system user password: %v", err)
+	}
+
+	return nil
+}
+
 // ChangeSystemUserPassword updates the system user's password with a newly prompted one.
 func ChangeSystemUserPassword(ctx context.Context, db *sqlx.DB) error {
 	// Prompt for password and get hashed password
