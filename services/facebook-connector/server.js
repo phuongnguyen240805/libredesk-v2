@@ -66,6 +66,8 @@ async function startBridge(cookies) {
   const child = spawn(config.bin, [], { stdio: ["pipe", "pipe", "pipe"] });
   bridge = child;
   let buffer = "";
+  let stderrTail = "";
+
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
     buffer += chunk;
@@ -76,17 +78,67 @@ async function startBridge(cookies) {
       if (line) consumeBridgeLine(line);
     }
   });
+
   child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => console.warn("[facebook-bridge]", chunk.trim()));
-  child.on("exit", (code) => {
-    rejectPending(new Error(`Facebook bridge exited (${code ?? "unknown"})`));
-    if (bridge === child) bridge = undefined;
-    if (intentionalStops.has(child)) return;
+  child.stderr.on("data", (chunk) => {
+    const text = String(chunk || "");
+    stderrTail = `${stderrTail}${text}`.slice(-8_000);
+    console.warn("[facebook-bridge]", text.trim());
+  });
+
+  child.on("error", (error) => {
+    // Only the currently active bridge is allowed to affect global RPC state.
+    if (bridge !== child) return;
+    bridge = undefined;
+    const message = `Facebook bridge spawn error: ${error.message}`;
+    rejectPending(new Error(message));
+    phase = "error";
+    lastError = message;
+    console.error("[facebook][trace] bridge.spawn_error", { error: error.message });
+    scheduleReconnect();
+  });
+
+  child.on("exit", (code, signal) => {
+    const intentional = intentionalStops.has(child);
+    const isCurrentBridge = bridge === child;
+
+    // IMPORTANT: a bridge that was intentionally stopped can exit after the
+    // replacement bridge has already started. Never let that stale process
+    // reject RPCs belonging to the replacement bridge.
+    if (!isCurrentBridge) {
+      console.log("[facebook][trace] bridge.exit.stale", {
+        code,
+        signal,
+        intentional,
+      });
+      return;
+    }
+
+    bridge = undefined;
+
+    if (intentional) {
+      console.log("[facebook][trace] bridge.exit.intentional", { code, signal });
+      return;
+    }
+
+    const reason = signal
+      ? `Facebook bridge exited by ${signal}`
+      : `Facebook bridge exited with code ${code ?? "unknown"}`;
+
+    rejectPending(new Error(reason));
     phase = "disconnected";
+    lastError = stderrTail.trim()
+      ? `${reason}: ${stderrTail.trim().slice(-2_000)}`
+      : reason;
     lastDisconnectedAt = new Date().toISOString();
     checkpoint.lastDisconnectedAt = lastDisconnectedAt;
     void persistCheckpoint();
-    console.warn("[facebook][trace] bridge.exit", { code });
+
+    console.warn("[facebook][trace] bridge.exit", {
+      code,
+      signal,
+      error: lastError,
+    });
     scheduleReconnect();
   });
 
@@ -95,40 +147,10 @@ async function startBridge(cookies) {
   profile = connected?.user;
   actualFacebookId = String(profile?.id || cookies.c_user || "");
 
-  // The connect response does not always carry the profile picture. Resolve the
-  // connected Facebook account itself so /status exposes a stable avatarUrl
-  // that the CSKH UI can use for outgoing bubbles.
-  if (/^\d+$/.test(actualFacebookId)) {
-    try {
-      const selfInfo = await rpc("getUserInfo", { userId: Number(actualFacebookId) }, 15_000);
-      profile = {
-        ...(profile && typeof profile === "object" ? profile : {}),
-        ...(selfInfo && typeof selfInfo === "object" ? selfInfo : {}),
-        id: actualFacebookId,
-        name: String(
-          selfInfo?.displayName ||
-          selfInfo?.name ||
-          selfInfo?.firstName ||
-          profile?.name ||
-          ""
-        ).trim() || undefined,
-        avatarUrl: String(
-          selfInfo?.avatarUrl ||
-          selfInfo?.profilePictureUrl ||
-          selfInfo?.profile_picture_url ||
-          profile?.avatarUrl ||
-          profile?.profilePictureUrl ||
-          ""
-        ).trim() || undefined,
-      };
-    } catch (error) {
-      console.warn(
-        "[facebook] unable to hydrate connected account profile:",
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-  }
-
+  // Keep profile hydration out of the critical connection path. Customer
+  // profiles are resolved lazily after E2EE is connected by
+  // getFacebookContact(). A profile lookup must never prevent Messenger from
+  // reaching the connected state.
   await rpc("connectE2EE", {});
   markConnected();
 }
@@ -136,11 +158,37 @@ async function startBridge(cookies) {
 async function stopBridge(intentional = true) {
   const child = bridge;
   if (!child) return;
+
   if (intentional) intentionalStops.add(child);
+
+  // Ask the bridge to shut down cleanly first. Ignore failures here because a
+  // dead/hung bridge still needs to be terminated.
   try { await rpc("disconnect", {}, 5_000); } catch { }
-  child.kill("SIGTERM");
+
+  // Clear the active bridge before SIGTERM. The exit handler will therefore
+  // recognise this process as stale/intentional and must not reject RPCs from
+  // a replacement bridge.
   if (bridge === child) bridge = undefined;
   rejectPending(new Error("Facebook bridge stopped"));
+
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGTERM");
+  }
+
+  // Do not start a replacement process until the previous one has had a short
+  // chance to exit. This removes the old-child/new-child lifecycle race.
+  await Promise.race([
+    new Promise((resolve) => child.once("exit", resolve)),
+    new Promise((resolve) => setTimeout(resolve, 2_000)),
+  ]);
+
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await Promise.race([
+      new Promise((resolve) => child.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 1_000)),
+    ]);
+  }
 }
 
 function markConnected() {
