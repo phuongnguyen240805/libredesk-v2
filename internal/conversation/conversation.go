@@ -160,6 +160,7 @@ type userStore interface {
 	GetAgentCachedOrLoad(int) (umodels.User, error)
 	GetSystemUser() (umodels.User, error)
 	CreateContact(user *umodels.User) error
+	UpdateContactBasicInfo(id int, firstName, lastName, email, phoneNumber, phoneNumberCountryCode string) error
 	UpdateAvatar(id int, path string) error
 	UpgradeVisitorToContact(visitorID int) error
 }

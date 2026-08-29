@@ -7,6 +7,10 @@ ENV GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /src
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN set -eux; \
     mkdir -p /src/deplao; \
     curl \
@@ -24,6 +28,10 @@ RUN set -eux; \
     rm -f /tmp/deplao.tar.gz
 
 WORKDIR /src/deplao/src/bridge-e2ee
+
+COPY services/facebook-connector/inject-profile-rpc.py /tmp/inject-profile-rpc.py
+RUN python3 /tmp/inject-profile-rpc.py /src/deplao/src/bridge-e2ee/main.go \
+    && gofmt -w /src/deplao/src/bridge-e2ee/main.go
 
 # ------------------------------------------------------------
 # go.mod uses local ./meta.

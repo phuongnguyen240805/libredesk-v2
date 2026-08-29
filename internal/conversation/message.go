@@ -870,10 +870,26 @@ func (m *Manager) ProcessIncomingMessage(in models.IncomingMessage) (models.Mess
 		}
 	}
 
-	// Keep an existing contact avatar in sync with the channel profile.
+	// Keep an existing contact profile in sync with the channel profile.
+	// This is important for channel connectors (Facebook/Zalo): the first event may
+	// arrive before profile hydration finishes and create a fallback contact name.
+	// A later event with the real profile must be allowed to repair that contact.
+	if senderID > 0 && (strings.TrimSpace(in.Contact.FirstName) != "" || strings.TrimSpace(in.Contact.LastName) != "") {
+		if err := m.userStore.UpdateContactBasicInfo(
+			senderID,
+			strings.TrimSpace(in.Contact.FirstName),
+			strings.TrimSpace(in.Contact.LastName),
+			"",
+			"",
+			"",
+		); err != nil {
+			m.lo.Warn("error updating contact name for incoming message", "contact_id", senderID, "error", err)
+		}
+	}
+
 	// Remote avatar URLs are preserved as-is; local /uploads paths continue to be signed by LibreDesk.
-	if senderID > 0 && in.Contact.AvatarURL.Valid && in.Contact.AvatarURL.String != "" {
-		if err := m.userStore.UpdateAvatar(senderID, in.Contact.AvatarURL.String); err != nil {
+	if senderID > 0 && in.Contact.AvatarURL.Valid && strings.TrimSpace(in.Contact.AvatarURL.String) != "" {
+		if err := m.userStore.UpdateAvatar(senderID, strings.TrimSpace(in.Contact.AvatarURL.String)); err != nil {
 			m.lo.Warn("error updating contact avatar for incoming message", "contact_id", senderID, "error", err)
 		}
 	}

@@ -105,10 +105,17 @@ async function startBridge(cookies) {
         ...(profile && typeof profile === "object" ? profile : {}),
         ...(selfInfo && typeof selfInfo === "object" ? selfInfo : {}),
         id: actualFacebookId,
-        name: String(selfInfo?.name || profile?.name || "").trim() || undefined,
+        name: String(
+          selfInfo?.displayName ||
+          selfInfo?.name ||
+          selfInfo?.firstName ||
+          profile?.name ||
+          ""
+        ).trim() || undefined,
         avatarUrl: String(
-          selfInfo?.profilePictureUrl ||
           selfInfo?.avatarUrl ||
+          selfInfo?.profilePictureUrl ||
+          selfInfo?.profile_picture_url ||
           profile?.avatarUrl ||
           profile?.profilePictureUrl ||
           ""
@@ -443,22 +450,66 @@ function safeISO(value) {
 }
 
 async function getFacebookContact(userId) {
-  if (!/^\d+$/.test(userId)) return undefined;
-  const cached = contactProfiles.get(userId);
+  const normalizedUserId = String(userId || "").trim();
+  if (!/^\d+$/.test(normalizedUserId)) return undefined;
+
+  const cached = contactProfiles.get(normalizedUserId);
   if (cached && cached.expiresAt > Date.now()) return cached.profile;
 
+  console.log("[facebook][profile] lookup.start", { userId: normalizedUserId });
+
   try {
-    const info = await rpc("getUserInfo", { userId: Number(userId) }, 15_000);
+    const info = await rpc(
+      "getUserInfo",
+      { userId: Number(normalizedUserId) },
+      25_000,
+    );
+
     const value = {
-      name: String(info?.name || info?.firstName || "").trim(),
-      avatarUrl: String(info?.profilePictureUrl || "").trim(),
+      name: String(
+        info?.displayName ||
+        info?.name ||
+        info?.firstName ||
+        info?.username ||
+        "",
+      ).trim(),
+      avatarUrl: String(
+        info?.avatarUrl ||
+        info?.profilePictureUrl ||
+        info?.profile_picture_url ||
+        info?.avatar ||
+        "",
+      ).trim(),
     };
+
     const resolved = value.name || value.avatarUrl ? value : undefined;
-    contactProfiles.set(userId, { profile: resolved, expiresAt: Date.now() + PROFILE_TTL_MS });
+    contactProfiles.set(normalizedUserId, {
+      profile: resolved,
+      expiresAt: Date.now() + PROFILE_TTL_MS,
+    });
+
+    if (resolved) {
+      console.log("[facebook][profile] lookup.ok", {
+        userId: normalizedUserId,
+        hasName: Boolean(resolved.name),
+        hasAvatar: Boolean(resolved.avatarUrl),
+      });
+    } else {
+      console.warn("[facebook][profile] lookup.empty", { userId: normalizedUserId });
+    }
+
     return resolved;
   } catch (error) {
-    contactProfiles.set(userId, { profile: undefined, expiresAt: Date.now() + PROFILE_ERROR_TTL_MS });
-    console.warn(`[facebook] unable to resolve profile ${userId}:`, error instanceof Error ? error.message : String(error));
+    // Cache failures only briefly so a temporary Messenger/LightSpeed problem
+    // does not leave the customer with the fallback name for hours.
+    contactProfiles.set(normalizedUserId, {
+      profile: undefined,
+      expiresAt: Date.now() + PROFILE_ERROR_TTL_MS,
+    });
+    console.warn("[facebook][profile] lookup.error", {
+      userId: normalizedUserId,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return undefined;
   }
 }
