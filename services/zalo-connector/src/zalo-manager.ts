@@ -1068,9 +1068,17 @@ function extractMessageId(value: unknown): string | undefined {
     return undefined;
   }
   if (!value || typeof value !== "object") return undefined;
+
   const record = value as Record<string, unknown>;
-  const id = record.msgId || record.messageId || record.cliMsgId;
-  return id == null ? undefined : String(id);
+  const directId = record.msgId || record.messageId || record.cliMsgId;
+  if (directId != null && String(directId).trim()) return String(directId);
+
+  // zca-js 2.1.2 sendMessage() returns:
+  // { message: { msgId }, attachment: [{ msgId }, ...] }
+  const messageId = extractMessageId(record.message);
+  if (messageId) return messageId;
+
+  return extractMessageId(record.attachment);
 }
 
 function ensureFileExtension(
