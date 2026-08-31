@@ -77,7 +77,7 @@ host = "${POSTGRES_HOST}"
 user = "${POSTGRES_USER}"
 password = "${POSTGRES_PASSWORD}"
 database = "${POSTGRES_DB}"
-ssl_mode = "require"
+ssl_mode = "${POSTGRES_SSL_MODE}"
 # Maximum number of open database connections
 max_open = 30
 # Maximum number of idle connections in the pool
