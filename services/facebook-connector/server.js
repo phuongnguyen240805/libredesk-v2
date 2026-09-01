@@ -572,12 +572,15 @@ async function pushWebhook(payload) {
         ? config.webhookURL.replace(/\/events\/?$/, "/presence")
         : config.webhookURL;
 
+  // event_type chỉ dùng nội bộ connector.
+  // Không gửi sang Nest vì ValidationPipe có thể reject field lạ.
   const webhookPayload = {
     ...payload,
   };
 
   delete webhookPayload.event_type;
 
+  // HMAC phải ký đúng raw body thực sự gửi đi.
   const body = JSON.stringify(webhookPayload);
 
   let error;
@@ -593,6 +596,17 @@ async function pushWebhook(payload) {
         .update(`${timestamp}.${body}`)
         .digest("hex");
 
+      console.log("[facebook][trace] webhook.request", {
+        eventId: payload.event_id,
+        attempt: attempt + 1,
+        targetURL,
+        eventType: eventType || "message",
+        direction: payload.direction,
+        accountId: payload.account_id,
+        threadId: payload.external_thread_id,
+        messageId: payload.external_message_id,
+      });
+
       const response = await fetch(targetURL, {
         method: "POST",
 
@@ -607,23 +621,58 @@ async function pushWebhook(payload) {
         signal: AbortSignal.timeout(20_000),
       });
 
-      if (!response.ok) {
-        const responseText = await response.text();
+      // QUAN TRỌNG:
+      // đọc response kể cả khi HTTP 2xx để biết Nest đã map message
+      // vào conversation/channel nào.
+      const responseText = await response.text();
 
+      let decoded;
+
+      try {
+        decoded = responseText
+          ? JSON.parse(responseText)
+          : {};
+      } catch {
+        decoded = {
+          raw: responseText,
+        };
+      }
+
+      console.log("[facebook][trace] webhook.response", {
+        eventId: payload.event_id,
+        attempt: attempt + 1,
+        status: response.status,
+        ok: response.ok,
+        targetURL,
+        response: responseText.slice(0, 1500),
+      });
+
+      if (!response.ok) {
         throw new Error(
           `Customer Care returned HTTP ${response.status}: ${responseText.slice(
             0,
-            300,
+            500,
           )}`,
         );
       }
 
-      return;
+      return {
+        status: response.status,
+        decoded,
+        responseText,
+      };
     } catch (reason) {
       error =
         reason instanceof Error
           ? reason
           : new Error(String(reason));
+
+      console.error("[facebook][trace] webhook.attempt.failed", {
+        eventId: payload.event_id,
+        attempt: attempt + 1,
+        targetURL,
+        error: error.message,
+      });
 
       /*
        * Retry:
@@ -632,7 +681,7 @@ async function pushWebhook(payload) {
        * attempt 1 -> 2s
        * attempt 2 -> 4s
        * attempt 3 -> 8s
-       * attempt 4 -> 16s
+       * attempt 4 -> fail -> durable outbox retry
        */
       if (attempt < 4) {
         await new Promise((resolve) =>
@@ -646,30 +695,85 @@ async function pushWebhook(payload) {
 }
 
 // async function pushWebhook(payload) {
-//   const body = JSON.stringify(payload);
+//   const eventType = payload.event_type;
+
+//   const targetURL =
+//     eventType === "delivery_status"
+//       ? config.webhookURL.replace(/\/events\/?$/, "/delivery")
+//       : eventType === "presence"
+//         ? config.webhookURL.replace(/\/events\/?$/, "/presence")
+//         : config.webhookURL;
+
+//   const webhookPayload = {
+//     ...payload,
+//   };
+
+//   delete webhookPayload.event_type;
+
+//   const body = JSON.stringify(webhookPayload);
+
 //   let error;
+
 //   for (let attempt = 0; attempt < 5; attempt += 1) {
 //     try {
 //       const timestamp = String(Date.now());
-//       const signature = createHmac("sha256", config.channelSecret).update(`${timestamp}.${body}`).digest("hex");
-//       const targetURL = payload.event_type === "delivery_status"
-//         ? config.webhookURL.replace(/\/events\/?$/, "/delivery")
-//         : payload.event_type === "presence"
-//           ? config.webhookURL.replace(/\/events\/?$/, "/presence")
-//           : config.webhookURL;
+
+//       const signature = createHmac(
+//         "sha256",
+//         config.channelSecret,
+//       )
+//         .update(`${timestamp}.${body}`)
+//         .digest("hex");
+
 //       const response = await fetch(targetURL, {
 //         method: "POST",
-//         headers: { "content-type": "application/json", "x-customer-care-timestamp": timestamp, "x-customer-care-signature": signature },
+
+//         headers: {
+//           "content-type": "application/json",
+//           "x-customer-care-timestamp": timestamp,
+//           "x-customer-care-signature": signature,
+//         },
+
 //         body,
+
 //         signal: AbortSignal.timeout(20_000),
 //       });
-//       if (!response.ok) throw new Error(`Customer Care returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+
+//       if (!response.ok) {
+//         const responseText = await response.text();
+
+//         throw new Error(
+//           `Customer Care returned HTTP ${response.status}: ${responseText.slice(
+//             0,
+//             300,
+//           )}`,
+//         );
+//       }
+
 //       return;
 //     } catch (reason) {
-//       error = reason;
-//       await new Promise((resolve) => setTimeout(resolve, 1_000 * 2 ** attempt));
+//       error =
+//         reason instanceof Error
+//           ? reason
+//           : new Error(String(reason));
+
+//       /*
+//        * Retry:
+//        *
+//        * attempt 0 -> 1s
+//        * attempt 1 -> 2s
+//        * attempt 2 -> 4s
+//        * attempt 3 -> 8s
+//        * attempt 4 -> 16s
+//        */
+//       if (attempt < 4) {
+//         await new Promise((resolve) =>
+//           setTimeout(resolve, 1_000 * 2 ** attempt),
+//         );
+//       }
 //     }
 //   }
+
 //   throw error;
 // }
 
@@ -755,13 +859,71 @@ function drainInboundOutbox() {
           pendingEvents: inboundOutbox.size,
           attemptCount: record.attemptCount ?? 0,
         });
+        // try {
+        //   await pushWebhook(payload);
+        //   inboundOutbox.delete(record.eventId);
+        //   rememberProcessedEvent(record.eventId);
+        //   await Promise.all([persistInboundOutbox(), persistCheckpoint()]);
+        //   console.log("[facebook][trace] webhook.ok", {
+        //     eventId: payload.event_id,
+        //     pendingEvents: inboundOutbox.size,
+        //   });
         try {
-          await pushWebhook(payload);
+          const webhookResult = await pushWebhook(payload);
+
           inboundOutbox.delete(record.eventId);
           rememberProcessedEvent(record.eventId);
-          await Promise.all([persistInboundOutbox(), persistCheckpoint()]);
+
+          await Promise.all([
+            persistInboundOutbox(),
+            persistCheckpoint(),
+          ]);
+
+          const decoded = webhookResult?.decoded ?? {};
+
+          // Nest đôi khi bọc response nhiều tầng data.
+          const level1 =
+            decoded && typeof decoded === "object"
+              ? decoded
+              : {};
+
+          const level2 =
+            level1.data && typeof level1.data === "object"
+              ? level1.data
+              : level1;
+
+          const level3 =
+            level2.data && typeof level2.data === "object"
+              ? level2.data
+              : level2;
+
           console.log("[facebook][trace] webhook.ok", {
             eventId: payload.event_id,
+            eventType: payload.event_type || "message",
+            direction: payload.direction,
+            threadId: payload.external_thread_id,
+            messageId: payload.external_message_id,
+
+            httpStatus: webhookResult?.status,
+
+            conversationUuid:
+              level3.conversation_uuid ||
+              level2.conversation_uuid ||
+              level1.conversation_uuid ||
+              null,
+
+            messageUuid:
+              level3.message_uuid ||
+              level2.message_uuid ||
+              level1.message_uuid ||
+              null,
+
+            duplicate:
+              level3.duplicate ??
+              level2.duplicate ??
+              level1.duplicate ??
+              null,
+
             pendingEvents: inboundOutbox.size,
           });
         } catch (error) {
