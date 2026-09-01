@@ -49,11 +49,19 @@ const inboundOutbox = new Map();
 const recentInboundEvents = new Set();
 const intentionalStops = new WeakSet();
 const contactProfiles = new Map();
+const contactProfileInFlight = new Map();
 const peerPresence = new Map();
 const presenceOfflineTimers = new Map();
 const FACEBOOK_ACTIVITY_ONLINE_TTL_MS = positiveInt("FACEBOOK_ACTIVITY_ONLINE_TTL_MS", 90_000);
 const PROFILE_TTL_MS = 6 * 60 * 60 * 1000;
 const PROFILE_ERROR_TTL_MS = 5 * 60 * 1000;
+// Chỉ áp dụng cho khách hoàn toàn mới.
+// Cache hit không phải chờ.
+// 900ms cân bằng giữa realtime và khả năng lấy đúng tên/avatar.
+const PROFILE_MESSAGE_WAIT_MS = positiveInt(
+  "FACEBOOK_PROFILE_MESSAGE_WAIT_MS",
+  900,
+);
 
 async function startBridge(cookies) {
   activeCookies = cookies;

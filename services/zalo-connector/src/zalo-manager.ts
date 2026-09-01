@@ -509,15 +509,13 @@ export class ZaloManager {
     const eventDisplayName =
       typeof event.data.dName === "string" ? event.data.dName.trim() : "";
 
-    // Keep customer profile enrichment off the realtime hot path. A cache hit is
-    // free; a cache miss gets only a tiny budget so a slow Zalo getUserInfo()
-    // cannot hold the message for seconds. The lookup continues in background.
+    // Hydrate the peer profile before emitting the first message. A cache hit is
+    // immediate; on a cache miss we allow a short bounded wait so both the real
+    // display name and avatar can travel with the webhook. The underlying lookup
+    // still continues in the background if Zalo responds after the budget.
     const profile =
       threadType === "user"
-        ? await this.getUserProfileFast(
-            peerExternalId,
-            eventDisplayName ? 0 : 120,
-          )
+        ? await this.getUserProfileFast(peerExternalId, 900)
         : { displayName: "", avatarUrl: "" };
 
     const displayName =
@@ -526,6 +524,14 @@ export class ZaloManager {
       (threadType === "group"
         ? `Nhóm Zalo ${externalThreadId}`
         : `Khách Zalo ${peerExternalId}`);
+
+    console.log("[zalo][profile] message.profile", {
+      userId: peerExternalId,
+      eventDisplayName: eventDisplayName || undefined,
+      profileDisplayName: profile.displayName || undefined,
+      hasAvatar: Boolean(profile.avatarUrl),
+      resolvedDisplayName: displayName,
+    });
 
     const payload: NormalizedZaloInbound = {
       event_id: `${this.accountId}:${direction}:message:${rawMessageId}`,
@@ -1023,20 +1029,30 @@ export class ZaloManager {
   private getUserProfile(
     userId: string,
   ): Promise<{ displayName: string; avatarUrl: string }> {
-    const cached = this.getCachedUserProfile(userId);
+    const normalizedUserId = String(userId || "").trim();
+    if (!normalizedUserId) {
+      return Promise.resolve({ displayName: "", avatarUrl: "" });
+    }
+
+    const cached = this.getCachedUserProfile(normalizedUserId);
     if (cached) return Promise.resolve(cached);
 
     const fallback = { displayName: "", avatarUrl: "" };
     if (!this.api) return Promise.resolve(fallback);
 
-    const existing = this.profileLookupInFlight.get(userId);
+    const existing = this.profileLookupInFlight.get(normalizedUserId);
     if (existing) return existing;
 
     const lookup = (async () => {
+      console.log("[zalo][profile] lookup.start", {
+        userId: normalizedUserId,
+      });
+
       try {
         const response = (await this.api!.getUserInfo(
-          userId,
+          normalizedUserId,
         )) as unknown as Record<string, unknown>;
+
         const changedProfiles =
           response.changed_profiles &&
           typeof response.changed_profiles === "object"
@@ -1045,29 +1061,80 @@ export class ZaloManager {
                 Record<string, unknown>
               >)
             : {};
+
+        // zca-js responses are not completely stable across message/account
+        // shapes. Prefer exact user-id keys, then the common `${id}_0` key,
+        // then a value whose userId matches, and finally a safe fallback.
         const profile =
-          changedProfiles[userId] ||
+          changedProfiles[normalizedUserId] ||
+          changedProfiles[`${normalizedUserId}_0`] ||
+          Object.values(changedProfiles).find(
+            (item) => stringValue(item.userId) === normalizedUserId,
+          ) ||
           Object.values(changedProfiles)[0] ||
           response;
-        const value: CachedProfile = {
-          displayName:
-            stringValue(profile.displayName) ||
-            stringValue(profile.zaloName) ||
-            "",
-          avatarUrl: stringValue(profile.avatar) || "",
-          expiresAt: Date.now() + 30 * 60_000,
-        };
-        this.profileCache.set(userId, value);
-        return { displayName: value.displayName, avatarUrl: value.avatarUrl };
+
+        const displayName =
+          stringValue(profile.displayName) ||
+          stringValue(profile.display_name) ||
+          stringValue(profile.zaloName) ||
+          stringValue(profile.zalo_name) ||
+          stringValue(profile.name) ||
+          stringValue(profile.username) ||
+          stringValue(profile.dName) ||
+          "";
+
+        const avatarUrl =
+          stringValue(profile.avatar) ||
+          stringValue(profile.avatarUrl) ||
+          stringValue(profile.avatar_url) ||
+          stringValue(profile.profilePictureUrl) ||
+          stringValue(profile.profile_picture_url) ||
+          stringValue(profile.picture) ||
+          stringValue(profile.photoUrl) ||
+          stringValue(profile.photo_url) ||
+          "";
+
+        // Do not cache a completely empty lookup for 30 minutes. A transient
+        // provider miss would otherwise leave the contact without a name/avatar
+        // long after Zalo has recovered.
+        if (displayName || avatarUrl) {
+          const value: CachedProfile = {
+            displayName,
+            avatarUrl,
+            expiresAt: Date.now() + 30 * 60_000,
+          };
+
+          this.profileCache.set(normalizedUserId, value);
+
+          console.log("[zalo][profile] lookup.ok", {
+            userId: normalizedUserId,
+            displayName: displayName || undefined,
+            hasAvatar: Boolean(avatarUrl),
+          });
+
+          return { displayName, avatarUrl };
+        }
+
+        console.warn("[zalo][profile] lookup.empty", {
+          userId: normalizedUserId,
+          responseKeys: Object.keys(response).slice(0, 20),
+          changedProfileKeys: Object.keys(changedProfiles).slice(0, 20),
+        });
+
+        return fallback;
       } catch (error) {
-        console.warn(`[zalo] cannot get profile for ${userId}:`, error);
+        console.warn(
+          `[zalo] cannot get profile for ${normalizedUserId}:`,
+          error,
+        );
         return fallback;
       }
     })().finally(() => {
-      this.profileLookupInFlight.delete(userId);
+      this.profileLookupInFlight.delete(normalizedUserId);
     });
 
-    this.profileLookupInFlight.set(userId, lookup);
+    this.profileLookupInFlight.set(normalizedUserId, lookup);
     return lookup;
   }
 
@@ -1105,7 +1172,9 @@ export class ZaloManager {
   }
 }
 
-function customerCareEventPriority(payload: CustomerCareConnectorEvent): number {
+function customerCareEventPriority(
+  payload: CustomerCareConnectorEvent,
+): number {
   if (!("event_type" in payload)) return 0;
   if (payload.event_type === "delivery_status") return 1;
   if (payload.event_type === "presence") return 2;
