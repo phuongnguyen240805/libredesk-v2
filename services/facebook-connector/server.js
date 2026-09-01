@@ -307,7 +307,8 @@ async function handleBridgeEvent(event) {
   }
   const threadType = Number(data.threadType) > 1 ? "group" : "user";
   const contactId = isSelf ? threadId : senderId;
-  const contact = await getFacebookContact(contactId);
+  const contact = await getFacebookContactFast(contactId, 120);
+  // const contact = await getFacebookContact(contactId);
   const attachments = Array.isArray(data.attachments) ? data.attachments : [];
   const text = String(data.text || "").trim() || attachmentPlaceholder(attachments);
   if (!text) return;
@@ -495,6 +496,55 @@ async function enqueueFacebookPresence(threadId, userId, state, lastActiveAt) {
 function safeISO(value) {
   const date = new Date(value || Date.now());
   return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
+function getCachedFacebookContact(userId) {
+  const normalizedUserId = String(userId || "").trim();
+
+  if (!normalizedUserId) {
+    return undefined;
+  }
+
+  const cached = contactProfiles.get(normalizedUserId);
+
+  if (!cached) {
+    return undefined;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    return undefined;
+  }
+
+  return cached.profile;
+}
+
+/**
+ * Realtime fast path:
+ * - cache có -> trả ngay
+ * - cache chưa có -> cho profile lookup tối đa 120ms
+ * - nếu quá 120ms -> message tiếp tục với fallback name
+ * - getFacebookContact vẫn chạy background và tự cache kết quả
+ */
+async function getFacebookContactFast(userId, budgetMs = 120) {
+  const cached = getCachedFacebookContact(userId);
+
+  if (cached) {
+    return cached;
+  }
+
+  const lookupPromise = getFacebookContact(userId);
+
+  return Promise.race([
+    lookupPromise,
+
+    new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        resolve(undefined);
+      }, budgetMs);
+
+      timer.unref?.();
+    }),
+  ]);
 }
 
 async function getFacebookContact(userId) {
@@ -843,7 +893,37 @@ function drainInboundOutbox() {
         clearTimeout(outboxRetryTimer);
         outboxRetryTimer = undefined;
       }
-      const records = [...inboundOutbox.values()].sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
+      const records = [...inboundOutbox.values()].sort((a, b) => {
+        const priority = (record) => {
+          const eventType = record?.payload?.event_type;
+
+          // Tin nhắn khách / agent luôn ưu tiên cao nhất.
+          if (!eventType) {
+            return 0;
+          }
+
+          // delivered / read đứng sau message.
+          if (eventType === "delivery_status") {
+            return 1;
+          }
+
+          // presence thấp nhất.
+          if (eventType === "presence") {
+            return 2;
+          }
+
+          return 1;
+        };
+
+        const priorityA = priority(a);
+        const priorityB = priority(b);
+
+        if (priorityA !== priorityB) {
+          return priorityA - priorityB;
+        }
+
+        return a.queuedAt.localeCompare(b.queuedAt);
+      });
       let failuresThisPass = 0;
 
       for (const record of records) {
@@ -859,15 +939,6 @@ function drainInboundOutbox() {
           pendingEvents: inboundOutbox.size,
           attemptCount: record.attemptCount ?? 0,
         });
-        // try {
-        //   await pushWebhook(payload);
-        //   inboundOutbox.delete(record.eventId);
-        //   rememberProcessedEvent(record.eventId);
-        //   await Promise.all([persistInboundOutbox(), persistCheckpoint()]);
-        //   console.log("[facebook][trace] webhook.ok", {
-        //     eventId: payload.event_id,
-        //     pendingEvents: inboundOutbox.size,
-        //   });
         try {
           const webhookResult = await pushWebhook(payload);
 

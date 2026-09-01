@@ -78,6 +78,10 @@ export class ZaloManager {
   private reconnectAttempts = 0;
   private outboxRetryTimer?: NodeJS.Timeout;
   private readonly profileCache = new Map<string, CachedProfile>();
+  private readonly profileLookupInFlight = new Map<
+    string,
+    Promise<{ displayName: string; avatarUrl: string }>
+  >();
   private readonly presencePeers = new Set<string>();
   private readonly presenceSignatures = new Map<string, string>();
   private presenceTimer?: NodeJS.Timeout;
@@ -240,6 +244,7 @@ export class ZaloManager {
     await clearCredentials(this.options.dataDir);
     this.profile = undefined;
     this.profileCache.clear();
+    this.profileLookupInFlight.clear();
     await this.markTrackedPresenceUnknown();
     this.presencePeers.clear();
     this.presenceSignatures.clear();
@@ -504,11 +509,15 @@ export class ZaloManager {
     const eventDisplayName =
       typeof event.data.dName === "string" ? event.data.dName.trim() : "";
 
-    // Profile lookup is enrichment only. getUserProfile() already catches
-    // DNS/API failures and returns an empty fallback.
+    // Keep customer profile enrichment off the realtime hot path. A cache hit is
+    // free; a cache miss gets only a tiny budget so a slow Zalo getUserInfo()
+    // cannot hold the message for seconds. The lookup continues in background.
     const profile =
       threadType === "user"
-        ? await this.getUserProfile(peerExternalId)
+        ? await this.getUserProfileFast(
+            peerExternalId,
+            eventDisplayName ? 0 : 120,
+          )
         : { displayName: "", avatarUrl: "" };
 
     const displayName =
@@ -692,9 +701,14 @@ export class ZaloManager {
           this.outboxRetryTimer = undefined;
         }
 
-        const records = [...this.inboundOutbox.values()].sort((a, b) =>
-          a.queuedAt.localeCompare(b.queuedAt),
-        );
+        // Realtime messages must not wait behind presence/read-receipt noise.
+        // Preserve FIFO only inside the same priority class.
+        const records = [...this.inboundOutbox.values()].sort((a, b) => {
+          const priorityDelta =
+            customerCareEventPriority(a.payload as CustomerCareConnectorEvent) -
+            customerCareEventPriority(b.payload as CustomerCareConnectorEvent);
+          return priorityDelta || a.queuedAt.localeCompare(b.queuedAt);
+        });
         let failuresThisPass = 0;
 
         for (const record of records) {
@@ -750,10 +764,13 @@ export class ZaloManager {
             const errorMessage =
               error instanceof Error ? error.message : String(error);
             const attemptCount = (record.attemptCount ?? 0) + 1;
-            const retryDelayMs = Math.min(
-              5 * 60_000,
-              15_000 * 2 ** Math.min(attemptCount - 1, 4),
-            );
+            const isMessageEvent = !("event_type" in payload);
+            const retryDelayMs = isMessageEvent
+              ? Math.min(60_000, 2_000 * 2 ** Math.min(attemptCount - 1, 5))
+              : Math.min(
+                  5 * 60_000,
+                  15_000 * 2 ** Math.min(attemptCount - 1, 4),
+                );
             const nextAttemptAt = new Date(
               Date.now() + retryDelayMs,
             ).toISOString();
@@ -965,43 +982,93 @@ export class ZaloManager {
     await this.enqueueInbound(payload, `presence:${userId}`, userId);
   }
 
-  private async getUserProfile(
+  private getCachedUserProfile(
     userId: string,
-  ): Promise<{ displayName: string; avatarUrl: string }> {
+  ): { displayName: string; avatarUrl: string } | undefined {
     const cached = this.profileCache.get(userId);
-    if (cached && cached.expiresAt > Date.now()) return cached;
+    if (!cached || cached.expiresAt <= Date.now()) return undefined;
+    return { displayName: cached.displayName, avatarUrl: cached.avatarUrl };
+  }
+
+  private async getUserProfileFast(
+    userId: string,
+    budgetMs = 120,
+  ): Promise<{ displayName: string; avatarUrl: string }> {
+    const cached = this.getCachedUserProfile(userId);
+    if (cached) return cached;
+
+    const lookup = this.getUserProfile(userId);
     const fallback = { displayName: "", avatarUrl: "" };
-    if (!this.api) return fallback;
-    try {
-      const response = (await this.api.getUserInfo(
-        userId,
-      )) as unknown as Record<string, unknown>;
-      const changedProfiles =
-        response.changed_profiles &&
-        typeof response.changed_profiles === "object"
-          ? (response.changed_profiles as Record<
-              string,
-              Record<string, unknown>
-            >)
-          : {};
-      const profile =
-        changedProfiles[userId] ||
-        Object.values(changedProfiles)[0] ||
-        response;
-      const value = {
-        displayName:
-          stringValue(profile.displayName) ||
-          stringValue(profile.zaloName) ||
-          "",
-        avatarUrl: stringValue(profile.avatar) || "",
-        expiresAt: Date.now() + 30 * 60_000,
-      };
-      this.profileCache.set(userId, value);
-      return value;
-    } catch (error) {
-      console.warn(`[zalo] cannot get profile for ${userId}:`, error);
+
+    // No need to wait when the native event already contains a display name.
+    if (budgetMs <= 0) {
+      void lookup.catch(() => undefined);
       return fallback;
     }
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        lookup,
+        new Promise<{ displayName: string; avatarUrl: string }>((resolve) => {
+          timer = setTimeout(() => resolve(fallback), budgetMs);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private getUserProfile(
+    userId: string,
+  ): Promise<{ displayName: string; avatarUrl: string }> {
+    const cached = this.getCachedUserProfile(userId);
+    if (cached) return Promise.resolve(cached);
+
+    const fallback = { displayName: "", avatarUrl: "" };
+    if (!this.api) return Promise.resolve(fallback);
+
+    const existing = this.profileLookupInFlight.get(userId);
+    if (existing) return existing;
+
+    const lookup = (async () => {
+      try {
+        const response = (await this.api!.getUserInfo(
+          userId,
+        )) as unknown as Record<string, unknown>;
+        const changedProfiles =
+          response.changed_profiles &&
+          typeof response.changed_profiles === "object"
+            ? (response.changed_profiles as Record<
+                string,
+                Record<string, unknown>
+              >)
+            : {};
+        const profile =
+          changedProfiles[userId] ||
+          Object.values(changedProfiles)[0] ||
+          response;
+        const value: CachedProfile = {
+          displayName:
+            stringValue(profile.displayName) ||
+            stringValue(profile.zaloName) ||
+            "",
+          avatarUrl: stringValue(profile.avatar) || "",
+          expiresAt: Date.now() + 30 * 60_000,
+        };
+        this.profileCache.set(userId, value);
+        return { displayName: value.displayName, avatarUrl: value.avatarUrl };
+      } catch (error) {
+        console.warn(`[zalo] cannot get profile for ${userId}:`, error);
+        return fallback;
+      }
+    })().finally(() => {
+      this.profileLookupInFlight.delete(userId);
+    });
+
+    this.profileLookupInFlight.set(userId, lookup);
+    return lookup;
   }
 
   private async persistCredentials(api: API): Promise<void> {
@@ -1038,6 +1105,13 @@ export class ZaloManager {
   }
 }
 
+function customerCareEventPriority(payload: CustomerCareConnectorEvent): number {
+  if (!("event_type" in payload)) return 0;
+  if (payload.event_type === "delivery_status") return 1;
+  if (payload.event_type === "presence") return 2;
+  return 1;
+}
+
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -1068,17 +1142,9 @@ function extractMessageId(value: unknown): string | undefined {
     return undefined;
   }
   if (!value || typeof value !== "object") return undefined;
-
   const record = value as Record<string, unknown>;
-  const directId = record.msgId || record.messageId || record.cliMsgId;
-  if (directId != null && String(directId).trim()) return String(directId);
-
-  // zca-js 2.1.2 sendMessage() returns:
-  // { message: { msgId }, attachment: [{ msgId }, ...] }
-  const messageId = extractMessageId(record.message);
-  if (messageId) return messageId;
-
-  return extractMessageId(record.attachment);
+  const id = record.msgId || record.messageId || record.cliMsgId;
+  return id == null ? undefined : String(id);
 }
 
 function ensureFileExtension(
