@@ -509,18 +509,22 @@ export class ZaloManager {
     const eventDisplayName =
       typeof event.data.dName === "string" ? event.data.dName.trim() : "";
 
-    // Hydrate the peer profile before emitting the first message. A cache hit is
-    // immediate; on a cache miss we allow a short bounded wait so both the real
-    // display name and avatar can travel with the webhook. The underlying lookup
-    // still continues in the background if Zalo responds after the budget.
+    // For native self messages dName can describe the logged-in Zalo account,
+    // not the peer. Never persist that as the customer name. Profile lookup is
+    // allowed only a tiny realtime budget; slow hydration is replayed below.
+    const safeEventDisplayName = isSelf ? "" : eventDisplayName;
+    const profileLookup =
+      threadType === "user"
+        ? this.getUserProfile(peerExternalId)
+        : Promise.resolve({ displayName: "", avatarUrl: "" });
     const profile =
       threadType === "user"
-        ? await this.getUserProfileFast(peerExternalId, 900)
+        ? await this.getUserProfileFast(peerExternalId, 80)
         : { displayName: "", avatarUrl: "" };
 
     const displayName =
       profile.displayName ||
-      eventDisplayName ||
+      safeEventDisplayName ||
       (threadType === "group"
         ? `Nhóm Zalo ${externalThreadId}`
         : `Khách Zalo ${peerExternalId}`);
@@ -569,6 +573,56 @@ export class ZaloManager {
     });
 
     await this.enqueueInbound(payload, rawMessageId, externalThreadId);
+
+    // Keep self-message delivery realtime. If getUserInfo() finishes after the
+    // 80 ms hot-path budget, replay the same native message with a new event id.
+    // Nest hydrates the contact before duplicate-message reconciliation, so the
+    // customer name/avatar update without inserting another chat message.
+    if (isSelf && threadType === "user") {
+      void profileLookup
+        .then(async (resolved) => {
+          const nextName = resolved.displayName || payload.sender.display_name;
+          const nextAvatar = resolved.avatarUrl || payload.sender.avatar_url || "";
+          const currentAvatar = payload.sender.avatar_url || "";
+
+          if (
+            nextName === payload.sender.display_name &&
+            nextAvatar === currentAvatar
+          ) {
+            return;
+          }
+
+          const hydrationPayload: NormalizedZaloInbound = {
+            ...payload,
+            event_id: `${payload.event_id}:profile`,
+            sender: {
+              ...payload.sender,
+              display_name: nextName,
+              avatar_url: nextAvatar || undefined,
+            },
+          };
+
+          console.log("[zalo][profile] hydrate.enqueue", {
+            eventId: hydrationPayload.event_id,
+            userId: peerExternalId,
+            hasName: Boolean(nextName),
+            hasAvatar: Boolean(nextAvatar),
+          });
+
+          await this.enqueueInbound(
+            hydrationPayload,
+            rawMessageId,
+            externalThreadId,
+          );
+        })
+        .catch((error) => {
+          console.warn("[zalo][profile] hydrate.failed", {
+            userId: peerExternalId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }
+
     this.lastMessageAt = payload.occurred_at;
   }
 
@@ -1102,7 +1156,11 @@ export class ZaloManager {
           const value: CachedProfile = {
             displayName,
             avatarUrl,
-            expiresAt: Date.now() + 30 * 60_000,
+            // Complete profiles are stable; partial ones are refreshed quickly
+            // so a transient missing avatar is not cached for 30 minutes.
+            expiresAt:
+              Date.now() +
+              (displayName && avatarUrl ? 30 * 60_000 : 60_000),
           };
 
           this.profileCache.set(normalizedUserId, value);

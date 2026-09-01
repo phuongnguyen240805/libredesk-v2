@@ -48,19 +48,40 @@ const outboundInFlight = new Map();
 const inboundOutbox = new Map();
 const recentInboundEvents = new Set();
 const intentionalStops = new WeakSet();
+// const FACEBOOK_ACTIVITY_ONLINE_TTL_MS = positiveInt("FACEBOOK_ACTIVITY_ONLINE_TTL_MS", 90_000);
+
 const contactProfiles = new Map();
+
+/*
+ * Chống gọi nhiều RPC getUserInfo cùng lúc cho cùng 1 user.
+ */
 const contactProfileInFlight = new Map();
+
 const peerPresence = new Map();
 const presenceOfflineTimers = new Map();
-const FACEBOOK_ACTIVITY_ONLINE_TTL_MS = positiveInt("FACEBOOK_ACTIVITY_ONLINE_TTL_MS", 90_000);
+
+const FACEBOOK_ACTIVITY_ONLINE_TTL_MS = positiveInt(
+  "FACEBOOK_ACTIVITY_ONLINE_TTL_MS",
+  90_000,
+);
+
+/*
+ * Profile đầy đủ được cache lâu.
+ * Profile thiếu name/avatar chỉ cache ngắn để có thể retry.
+ * Lỗi provider chỉ cache rất ngắn.
+ */
 const PROFILE_TTL_MS = 6 * 60 * 60 * 1000;
-const PROFILE_ERROR_TTL_MS = 5 * 60 * 1000;
-// Chỉ áp dụng cho khách hoàn toàn mới.
-// Cache hit không phải chờ.
-// 900ms cân bằng giữa realtime và khả năng lấy đúng tên/avatar.
+const PROFILE_PARTIAL_TTL_MS = 60_000;
+const PROFILE_ERROR_TTL_MS = 15_000;
+
+/*
+ * Hot path message chỉ chờ profile tối đa 80ms.
+ * Nếu profile chưa về, message vẫn đi ngay.
+ * Profile tiếp tục chạy background và hydrate contact sau.
+ */
 const PROFILE_MESSAGE_WAIT_MS = positiveInt(
   "FACEBOOK_PROFILE_MESSAGE_WAIT_MS",
-  900,
+  80,
 );
 
 async function startBridge(cookies) {
@@ -313,52 +334,336 @@ async function handleBridgeEvent(event) {
       clientMessageId: connectorOutbound.clientMessageId,
     });
   }
-  const threadType = Number(data.threadType) > 1 ? "group" : "user";
-  const contactId = isSelf ? threadId : senderId;
-  const contact = await getFacebookContactFast(contactId, 120);
-  // const contact = await getFacebookContact(contactId);
-  const attachments = Array.isArray(data.attachments) ? data.attachments : [];
-  const text = String(data.text || "").trim() || attachmentPlaceholder(attachments);
+  const threadType =
+    Number(data.threadType) > 1
+      ? "group"
+      : "user";
+
+  const contactId =
+    isSelf ? threadId : senderId;
+
+  /*
+   * Khởi động profile lookup ngay.
+   *
+   * getFacebookContactFast() bên dưới chỉ chờ tối đa 80ms.
+   * Nếu Messenger chậm thì Promise này vẫn tiếp tục chạy background.
+   */
+  const contactLookup =
+    threadType === "user"
+      ? getFacebookContact(contactId)
+      : Promise.resolve(undefined);
+
+  const contact =
+    threadType === "user"
+      ? await getFacebookContactFast(
+        contactId,
+        PROFILE_MESSAGE_WAIT_MS,
+      )
+      : undefined;
+
+  /*
+   * Event native đôi khi đã có tên.
+   * Đây là fallback tốt hơn "Khách Facebook <id>".
+   */
+  const eventContactName = String(
+    data.threadName ||
+    data.senderName ||
+    data.displayName ||
+    "",
+  ).trim();
+
+  const attachments =
+    Array.isArray(data.attachments)
+      ? data.attachments
+      : [];
+
+  const text =
+    String(data.text || "").trim() ||
+    attachmentPlaceholder(attachments);
+
   if (!text) return;
-  const accountId = actualFacebookId || config.accountId;
-  const occurredAt = new Date(Number(data.timestampMs || event.timestamp || Date.now())).toISOString();
+
+  const accountId =
+    actualFacebookId ||
+    config.accountId;
+
+  const occurredAt = new Date(
+    Number(
+      data.timestampMs ||
+      event.timestamp ||
+      Date.now(),
+    ),
+  ).toISOString();
+
   if (!isSelf && threadType === "user") {
-    void markFacebookPeerActive(threadId, contactId, occurredAt).catch((error) => {
-      console.warn("[facebook] presence activity update failed:", error instanceof Error ? error.message : String(error));
+    void markFacebookPeerActive(
+      threadId,
+      contactId,
+      occurredAt,
+    ).catch((error) => {
+      console.warn(
+        "[facebook] presence activity update failed:",
+        error instanceof Error
+          ? error.message
+          : String(error),
+      );
     });
   }
+
   const payload = {
-    event_id: `${accountId}:${isSelf ? "outgoing" : "incoming"}:message:${messageId}`,
+    event_id:
+      `${accountId}:${isSelf ? "outgoing" : "incoming"
+      }:message:${messageId}`,
+
     provider: "facebook_personal",
+
     account_id: accountId,
-    direction: isSelf ? "outgoing" : "incoming",
+
+    direction:
+      isSelf ? "outgoing" : "incoming",
+
     is_self: isSelf,
+
     external_thread_id: threadId,
-    external_message_id: `${accountId}:${messageId}`,
-    ...(connectorOutbound?.clientMessageId ? { client_message_id: connectorOutbound.clientMessageId } : {}),
+
+    external_message_id:
+      `${accountId}:${messageId}`,
+
+    ...(connectorOutbound?.clientMessageId
+      ? {
+        client_message_id:
+          connectorOutbound.clientMessageId,
+      }
+      : {}),
+
     thread_type: threadType,
+
     occurred_at: occurredAt,
+
     sender: {
       external_id: contactId,
+
       display_name: String(
-        (threadType === "group" ? data.threadName : contact?.name)
-        || contact?.name
-        || data.threadName
-        || `Khách Facebook ${contactId}`,
+        (
+          threadType === "group"
+            ? data.threadName
+            : contact?.name
+        ) ||
+        contact?.name ||
+        eventContactName ||
+        `Khách Facebook ${contactId}`,
       ),
-      ...(contact?.avatarUrl ? { avatar_url: contact.avatarUrl } : {}),
+
+      ...(contact?.avatarUrl
+        ? {
+          avatar_url:
+            contact.avatarUrl,
+        }
+        : {}),
     },
-    message: { type: "text", text },
+
+    message: {
+      type: "text",
+      text,
+    },
   };
-  console.log("[facebook][trace] message.detected", {
-    eventId: payload.event_id,
-    direction: payload.direction,
-    isSelf,
+
+  console.log(
+    "[facebook][trace] message.detected",
+    {
+      eventId: payload.event_id,
+      direction: payload.direction,
+      isSelf,
+      threadId,
+      messageId:
+        payload.external_message_id,
+
+      profile: {
+        name:
+          payload.sender.display_name,
+        hasAvatar:
+          Boolean(
+            payload.sender.avatar_url,
+          ),
+      },
+    },
+  );
+
+  /*
+   * MESSAGE ĐI NGAY.
+   */
+  await enqueueInbound(
+    payload,
+    messageId,
     threadId,
-    messageId: payload.external_message_id,
-  });
-  await enqueueInbound(payload, messageId, threadId);
+  );
+
+  /*
+   * QUAN TRỌNG:
+   *
+   * Trường hợp người dùng gửi tin trực tiếp từ chính
+   * account Facebook đang kết nối:
+   *
+   * threadId = customer Facebook id.
+   *
+   * Nếu profile chưa về trong 80ms thì message đã được
+   * đẩy realtime trước.
+   *
+   * Khi profile RPC hoàn tất, gửi lại cùng
+   * external_message_id nhưng event_id khác.
+   *
+   * Backend đã được sửa để:
+   *   - update name/avatar
+   *   - phát contact.updated
+   *   - KHÔNG tạo message duplicate.
+   */
+  if (
+    isSelf &&
+    threadType === "user"
+  ) {
+    void contactLookup
+      .then(async (resolved) => {
+        if (!resolved) return;
+
+        const nextName =
+          resolved.name ||
+          payload.sender.display_name;
+
+        const nextAvatar =
+          resolved.avatarUrl ||
+          payload.sender.avatar_url ||
+          "";
+
+        const currentAvatar =
+          payload.sender.avatar_url ||
+          "";
+
+        /*
+         * Profile ban đầu đã đầy đủ rồi thì không
+         * cần gửi hydration event.
+         */
+        if (
+          nextName ===
+          payload.sender.display_name &&
+          nextAvatar === currentAvatar
+        ) {
+          return;
+        }
+
+        const hydrationPayload = {
+          ...payload,
+
+          /*
+           * event_id PHẢI khác để vượt qua
+           * inbound event idempotency.
+           *
+           * external_message_id vẫn giữ nguyên
+           * để backend nhận ra đây là cùng message.
+           */
+          event_id:
+            `${payload.event_id}:profile`,
+
+          sender: {
+            ...payload.sender,
+
+            display_name:
+              nextName,
+
+            ...(nextAvatar
+              ? {
+                avatar_url:
+                  nextAvatar,
+              }
+              : {}),
+          },
+        };
+
+        console.log(
+          "[facebook][profile] hydrate.enqueue",
+          {
+            eventId:
+              hydrationPayload.event_id,
+
+            userId:
+              contactId,
+
+            name:
+              nextName,
+
+            hasAvatar:
+              Boolean(nextAvatar),
+          },
+        );
+
+        await enqueueInbound(
+          hydrationPayload,
+          messageId,
+          threadId,
+        );
+      })
+      .catch((error) => {
+        console.warn(
+          "[facebook][profile] hydrate.failed",
+          {
+            userId:
+              contactId,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error),
+          },
+        );
+      });
+  }
+
   lastMessageAt = occurredAt;
+  // const threadType = Number(data.threadType) > 1 ? "group" : "user";
+  // const contactId = isSelf ? threadId : senderId;
+  // const contact = await getFacebookContactFast(contactId, 120);
+  // // const contact = await getFacebookContact(contactId);
+  // const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+  // const text = String(data.text || "").trim() || attachmentPlaceholder(attachments);
+  // if (!text) return;
+  // const accountId = actualFacebookId || config.accountId;
+  // const occurredAt = new Date(Number(data.timestampMs || event.timestamp || Date.now())).toISOString();
+  // if (!isSelf && threadType === "user") {
+  //   void markFacebookPeerActive(threadId, contactId, occurredAt).catch((error) => {
+  //     console.warn("[facebook] presence activity update failed:", error instanceof Error ? error.message : String(error));
+  //   });
+  // }
+  // const payload = {
+  //   event_id: `${accountId}:${isSelf ? "outgoing" : "incoming"}:message:${messageId}`,
+  //   provider: "facebook_personal",
+  //   account_id: accountId,
+  //   direction: isSelf ? "outgoing" : "incoming",
+  //   is_self: isSelf,
+  //   external_thread_id: threadId,
+  //   external_message_id: `${accountId}:${messageId}`,
+  //   ...(connectorOutbound?.clientMessageId ? { client_message_id: connectorOutbound.clientMessageId } : {}),
+  //   thread_type: threadType,
+  //   occurred_at: occurredAt,
+  //   sender: {
+  //     external_id: contactId,
+  //     display_name: String(
+  //       (threadType === "group" ? data.threadName : contact?.name)
+  //       || contact?.name
+  //       || data.threadName
+  //       || `Khách Facebook ${contactId}`,
+  //     ),
+  //     ...(contact?.avatarUrl ? { avatar_url: contact.avatarUrl } : {}),
+  //   },
+  //   message: { type: "text", text },
+  // };
+  // console.log("[facebook][trace] message.detected", {
+  //   eventId: payload.event_id,
+  //   direction: payload.direction,
+  //   isSelf,
+  //   threadId,
+  //   messageId: payload.external_message_id,
+  // });
+  // await enqueueInbound(payload, messageId, threadId);
+  // lastMessageAt = occurredAt;
 }
 
 async function handleFacebookReadReceipt(event) {
@@ -506,20 +811,28 @@ function safeISO(value) {
   return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
 }
 
-function getCachedFacebookContact(userId) {
-  const normalizedUserId = String(userId || "").trim();
+function getCachedFacebookContact(
+  userId,
+) {
+  const normalizedUserId =
+    String(userId || "").trim();
 
   if (!normalizedUserId) {
     return undefined;
   }
 
-  const cached = contactProfiles.get(normalizedUserId);
+  const cached =
+    contactProfiles.get(
+      normalizedUserId,
+    );
 
   if (!cached) {
     return undefined;
   }
 
-  if (cached.expiresAt <= Date.now()) {
+  if (
+    cached.expiresAt <= Date.now()
+  ) {
     return undefined;
   }
 
@@ -527,98 +840,411 @@ function getCachedFacebookContact(userId) {
 }
 
 /**
- * Realtime fast path:
- * - cache có -> trả ngay
- * - cache chưa có -> cho profile lookup tối đa 120ms
- * - nếu quá 120ms -> message tiếp tục với fallback name
- * - getFacebookContact vẫn chạy background và tự cache kết quả
+ * Hot-path profile lookup.
+ *
+ * cache hit:
+ *   gần như 0ms
+ *
+ * cache miss:
+ *   chờ tối đa PROFILE_MESSAGE_WAIT_MS.
+ *
+ * timeout:
+ *   message vẫn tiếp tục,
+ *   getFacebookContact() vẫn chạy background.
  */
-async function getFacebookContactFast(userId, budgetMs = 120) {
-  const cached = getCachedFacebookContact(userId);
+async function getFacebookContactFast(
+  userId,
+  budgetMs = PROFILE_MESSAGE_WAIT_MS,
+) {
+  const cached =
+    getCachedFacebookContact(
+      userId,
+    );
 
   if (cached) {
     return cached;
   }
 
-  const lookupPromise = getFacebookContact(userId);
+  const lookupPromise =
+    getFacebookContact(userId);
 
-  return Promise.race([
-    lookupPromise,
-
-    new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        resolve(undefined);
-      }, budgetMs);
-
-      timer.unref?.();
-    }),
-  ]);
-}
-
-async function getFacebookContact(userId) {
-  const normalizedUserId = String(userId || "").trim();
-  if (!/^\d+$/.test(normalizedUserId)) return undefined;
-
-  const cached = contactProfiles.get(normalizedUserId);
-  if (cached && cached.expiresAt > Date.now()) return cached.profile;
-
-  console.log("[facebook][profile] lookup.start", { userId: normalizedUserId });
+  let timer;
 
   try {
-    const info = await rpc(
-      "getUserInfo",
-      { userId: Number(normalizedUserId) },
-      25_000,
-    );
+    return await Promise.race([
+      lookupPromise,
 
-    const value = {
-      name: String(
-        info?.displayName ||
-        info?.name ||
-        info?.firstName ||
-        info?.username ||
-        "",
-      ).trim(),
-      avatarUrl: String(
-        info?.avatarUrl ||
-        info?.profilePictureUrl ||
-        info?.profile_picture_url ||
-        info?.avatar ||
-        "",
-      ).trim(),
-    };
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => {
+            resolve(undefined);
+          },
+          budgetMs,
+        );
 
-    const resolved = value.name || value.avatarUrl ? value : undefined;
-    contactProfiles.set(normalizedUserId, {
-      profile: resolved,
-      expiresAt: Date.now() + PROFILE_TTL_MS,
-    });
-
-    if (resolved) {
-      console.log("[facebook][profile] lookup.ok", {
-        userId: normalizedUserId,
-        hasName: Boolean(resolved.name),
-        hasAvatar: Boolean(resolved.avatarUrl),
-      });
-    } else {
-      console.warn("[facebook][profile] lookup.empty", { userId: normalizedUserId });
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
     }
-
-    return resolved;
-  } catch (error) {
-    // Cache failures only briefly so a temporary Messenger/LightSpeed problem
-    // does not leave the customer with the fallback name for hours.
-    contactProfiles.set(normalizedUserId, {
-      profile: undefined,
-      expiresAt: Date.now() + PROFILE_ERROR_TTL_MS,
-    });
-    console.warn("[facebook][profile] lookup.error", {
-      userId: normalizedUserId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return undefined;
   }
 }
+
+/**
+ * Full Facebook profile lookup.
+ *
+ * Function này KHÔNG nằm trên realtime critical path.
+ */
+async function getFacebookContact(
+  userId,
+) {
+  const normalizedUserId =
+    String(userId || "").trim();
+
+  if (
+    !/^\d+$/.test(
+      normalizedUserId,
+    )
+  ) {
+    return undefined;
+  }
+
+  const cached =
+    contactProfiles.get(
+      normalizedUserId,
+    );
+
+  if (
+    cached &&
+    cached.expiresAt >
+    Date.now()
+  ) {
+    return cached.profile;
+  }
+
+  /*
+   * Một user chỉ có 1 getUserInfo RPC
+   * tại cùng một thời điểm.
+   */
+  const existingLookup =
+    contactProfileInFlight.get(
+      normalizedUserId,
+    );
+
+  if (existingLookup) {
+    return existingLookup;
+  }
+
+  const lookup = (async () => {
+    console.log(
+      "[facebook][profile] lookup.start",
+      {
+        userId:
+          normalizedUserId,
+      },
+    );
+
+    try {
+      /*
+       * Profile chỉ là enrichment.
+       * Không cần timeout 25-30 giây.
+       */
+      const info = await rpc(
+        "getUserInfo",
+        {
+          userId: Number(
+            normalizedUserId,
+          ),
+        },
+        5_000,
+      );
+
+      /*
+       * Các version bridge khác nhau có thể
+       * trả profile ở root hoặc nested.
+       */
+      const nested =
+        info?.profile &&
+          typeof info.profile ===
+          "object"
+          ? info.profile
+          : info?.user &&
+            typeof info.user ===
+            "object"
+            ? info.user
+            : info?.data &&
+              typeof info.data ===
+              "object"
+              ? info.data
+              : {};
+
+      const source = {
+        ...(
+          info &&
+            typeof info === "object"
+            ? info
+            : {}
+        ),
+
+        ...nested,
+      };
+
+      const pictureData =
+        source.picture &&
+          typeof source.picture === "object" &&
+          source.picture.data &&
+          typeof source.picture.data === "object"
+          ? source.picture.data
+          : {};
+
+      const value = {
+        name: String(
+          source.displayName ||
+          source.display_name ||
+          source.name ||
+          source.fullName ||
+          source.full_name ||
+          source.firstName ||
+          source.first_name ||
+          source.username ||
+          "",
+        ).trim(),
+
+        avatarUrl: String(
+          source.avatarUrl ||
+          source.avatar_url ||
+          source.profilePictureUrl ||
+          source.profile_picture_url ||
+          source.profilePicUrl ||
+          source.profile_pic_url ||
+          source.photoUrl ||
+          source.photo_url ||
+          pictureData.url ||
+          (typeof source.picture === "string"
+            ? source.picture
+            : "") ||
+          source.avatar ||
+          "",
+        ).trim(),
+      };
+
+      const resolved =
+        value.name ||
+          value.avatarUrl
+          ? value
+          : undefined;
+
+      if (resolved) {
+        /*
+         * Nếu có cả name + avatar:
+         * cache lâu.
+         *
+         * Nếu chỉ có một phần:
+         * cache ngắn để còn retry.
+         */
+        const complete =
+          Boolean(
+            resolved.name,
+          ) &&
+          Boolean(
+            resolved.avatarUrl,
+          );
+
+        contactProfiles.set(
+          normalizedUserId,
+          {
+            profile:
+              resolved,
+
+            expiresAt:
+              Date.now() +
+              (
+                complete
+                  ? PROFILE_TTL_MS
+                  : PROFILE_PARTIAL_TTL_MS
+              ),
+          },
+        );
+
+        console.log(
+          "[facebook][profile] lookup.ok",
+          {
+            userId:
+              normalizedUserId,
+
+            name:
+              resolved.name ||
+              undefined,
+
+            hasName:
+              Boolean(
+                resolved.name,
+              ),
+
+            hasAvatar:
+              Boolean(
+                resolved.avatarUrl,
+              ),
+          },
+        );
+      } else {
+        /*
+         * Không cache empty profile lâu.
+         */
+        console.warn(
+          "[facebook][profile] lookup.empty",
+          {
+            userId:
+              normalizedUserId,
+
+            keys:
+              info &&
+                typeof info ===
+                "object"
+                ? Object.keys(
+                  info,
+                ).slice(
+                  0,
+                  20,
+                )
+                : [],
+          },
+        );
+      }
+
+      return resolved;
+    } catch (error) {
+      /*
+       * Provider lỗi tạm thời:
+       * chỉ cache 15s.
+       */
+      contactProfiles.set(
+        normalizedUserId,
+        {
+          profile:
+            undefined,
+
+          expiresAt:
+            Date.now() +
+            PROFILE_ERROR_TTL_MS,
+        },
+      );
+
+      console.warn(
+        "[facebook][profile] lookup.error",
+        {
+          userId:
+            normalizedUserId,
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+        },
+      );
+
+      return undefined;
+    } finally {
+      contactProfileInFlight.delete(
+        normalizedUserId,
+      );
+    }
+  })();
+
+  contactProfileInFlight.set(
+    normalizedUserId,
+    lookup,
+  );
+
+  return lookup;
+}
+
+// function getCachedFacebookContact(userId) {
+//   const normalizedUserId = String(userId || "").trim();
+
+//   if (!normalizedUserId) {
+//     return undefined;
+//   }
+
+//   const cached = contactProfiles.get(normalizedUserId);
+
+//   if (!cached) {
+//     return undefined;
+//   }
+
+//   if (cached.expiresAt <= Date.now()) {
+//     return undefined;
+//   }
+
+//   return cached.profile;
+// }
+
+// async function getFacebookContact(userId) {
+//   const normalizedUserId = String(userId || "").trim();
+//   if (!/^\d+$/.test(normalizedUserId)) return undefined;
+
+//   const cached = contactProfiles.get(normalizedUserId);
+//   if (cached && cached.expiresAt > Date.now()) return cached.profile;
+
+//   console.log("[facebook][profile] lookup.start", { userId: normalizedUserId });
+
+//   try {
+//     const info = await rpc(
+//       "getUserInfo",
+//       { userId: Number(normalizedUserId) },
+//       25_000,
+//     );
+
+//     const value = {
+//       name: String(
+//         info?.displayName ||
+//         info?.name ||
+//         info?.firstName ||
+//         info?.username ||
+//         "",
+//       ).trim(),
+//       avatarUrl: String(
+//         info?.avatarUrl ||
+//         info?.profilePictureUrl ||
+//         info?.profile_picture_url ||
+//         info?.avatar ||
+//         "",
+//       ).trim(),
+//     };
+
+//     const resolved = value.name || value.avatarUrl ? value : undefined;
+//     contactProfiles.set(normalizedUserId, {
+//       profile: resolved,
+//       expiresAt: Date.now() + PROFILE_TTL_MS,
+//     });
+
+//     if (resolved) {
+//       console.log("[facebook][profile] lookup.ok", {
+//         userId: normalizedUserId,
+//         hasName: Boolean(resolved.name),
+//         hasAvatar: Boolean(resolved.avatarUrl),
+//       });
+//     } else {
+//       console.warn("[facebook][profile] lookup.empty", { userId: normalizedUserId });
+//     }
+
+//     return resolved;
+//   } catch (error) {
+//     // Cache failures only briefly so a temporary Messenger/LightSpeed problem
+//     // does not leave the customer with the fallback name for hours.
+//     contactProfiles.set(normalizedUserId, {
+//       profile: undefined,
+//       expiresAt: Date.now() + PROFILE_ERROR_TTL_MS,
+//     });
+//     console.warn("[facebook][profile] lookup.error", {
+//       userId: normalizedUserId,
+//       error: error instanceof Error ? error.message : String(error),
+//     });
+//     return undefined;
+//   }
+// }
 
 async function pushWebhook(payload) {
   const eventType = payload.event_type;
